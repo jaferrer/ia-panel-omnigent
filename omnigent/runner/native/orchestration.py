@@ -2161,7 +2161,17 @@ async def _auto_create_pi_terminal(
         # Provider-qualified picker values select one of the models rendered
         # from the provider configured through ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
-        provider = resolve_pi_native_provider(model=spec_model)
+        from omnigent.pi_native_credentials import (
+            omniroute_combo_launch_args,
+            omniroute_combo_model_options,
+        )
+
+        combo_ids = {str(option["id"]) for option in omniroute_combo_model_options()}
+        if spec_model is not None and spec_model in combo_ids:
+            pi_args.extend(omniroute_combo_launch_args(spec_model))
+            provider = None
+        else:
+            provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(
                 bridge_dir / "pi-agent",

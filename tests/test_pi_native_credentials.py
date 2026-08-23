@@ -31,6 +31,45 @@ def _databricks_config() -> dict[str, object]:
     }
 
 
+
+def test_omniroute_combo_options_filters_and_sorts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OmniRoute contributes only user-defined combo ids to the Pi picker."""
+    monkeypatch.setenv("OMNIROUTE_URL", "http://127.0.0.1:20128")
+    monkeypatch.setattr(
+        creds,
+        "_fetch_omniroute_models",
+        lambda _url: {
+            "data": [
+                {"id": "Zulu", "owned_by": "combo"},
+                {"id": "auto/best-coding", "owned_by": "combo"},
+                {"id": "provider/model", "owned_by": "provider"},
+                {"id": "Alpha", "owned_by": "combo"},
+            ]
+        },
+    )
+
+    assert creds.omniroute_combo_model_options() == [
+        {"id": "Alpha", "model": "Alpha", "displayName": "Alpha"},
+        {"id": "Zulu", "model": "Zulu", "displayName": "Zulu"},
+    ]
+
+
+def test_omniroute_combo_launch_args() -> None:
+    """A combo selected in the GUI launches Pi through its OmniRoute extension."""
+    assert creds.omniroute_combo_launch_args("Fable5-WA") == [
+        "--omniroute",
+        "--model",
+        "Fable5-WA",
+    ]
+
+
+def test_pi_native_model_options_prefers_omniroute_combos(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live OmniRoute combo catalog replaces generic setup providers."""
+    combos = [{"id": "Fable5-WA", "model": "Fable5-WA", "displayName": "Fable5-WA"}]
+    monkeypatch.setattr(creds, "omniroute_combo_model_options", lambda: combos)
+
+    assert creds.pi_native_model_options() == combos
+
 def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
     """A Databricks default → Pi anthropic-messages gateway provider.
 
@@ -384,6 +423,7 @@ def test_pi_native_model_options_lists_only_managed_models(
         },
     )
     monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda: provider)
+    monkeypatch.setattr(creds, "omniroute_combo_model_options", list)
 
     assert creds.pi_native_model_options() == [
         {

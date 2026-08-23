@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import subprocess
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -367,8 +368,46 @@ class PiProviderConfig:
         )
 
 
+def _fetch_omniroute_models(base_url: str) -> dict[str, object]:
+    """Fetch OmniRoute's OpenAI-compatible model catalog."""
+    with urllib.request.urlopen(f"{base_url.rstrip('/')}/v1/models", timeout=3) as response:
+        return json.load(response)
+
+
+def omniroute_combo_model_options() -> list[dict[str, object]]:
+    """Return user-defined OmniRoute combos when the local gateway is live."""
+    base_url = os.environ.get("OMNIROUTE_URL", "http://127.0.0.1:20128")
+    try:
+        payload = _fetch_omniroute_models(base_url)
+    except (OSError, ValueError):
+        return []
+
+    data = payload.get("data", [])
+    if not isinstance(data, list):
+        return []
+    ids = sorted(
+        str(model.get("id", "")).strip()
+        for model in data
+        if isinstance(model, dict) and model.get("owned_by") == "combo"
+    )
+    return [
+        {"id": model_id, "model": model_id, "displayName": model_id}
+        for model_id in ids
+        if model_id and "/" not in model_id
+    ]
+
+
+def omniroute_combo_launch_args(model: str) -> list[str]:
+    """Return Pi args for a combo selected from OmniRoute's catalog."""
+    return ["--omniroute", "--model", model]
+
+
 def pi_native_model_options() -> list[dict[str, object]]:
     """Return pre-launch Pi choices configured through ``omni setup``."""
+    combos = omniroute_combo_model_options()
+    if combos:
+        return combos
+
     provider = resolve_pi_native_provider()
     if provider is None:
         return []
