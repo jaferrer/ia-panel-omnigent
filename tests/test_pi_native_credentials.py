@@ -1800,3 +1800,105 @@ def test_default_claude_model_from_picks_by_tier_then_newest() -> None:
     assert _default_claude_model_from(entries) == "system.ai.claude-opus-5"
     # An empty live listing lets the caller fall through to the bundled catalog.
     assert _default_claude_model_from([]) is None
+
+
+# ── OMPR corporate mode (fail-closed combo catalog contract) ────────────────
+#
+# Corporate OMPR deployments (OMNIGENT_OMPR_CORPORATE=1, injected by the
+# ia-portal installer) treat OmniRoute's combo catalog as the ONLY model
+# source. An empty or unreachable ``GET /v1/models`` must fail closed —
+# never fall back to the legacy managed provider — and a launch must carry
+# an explicit ``--model`` combo id.
+
+
+def test_ompr_corporate_mode_env_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The corporate gate is an explicit, truthy OMNIGENT_OMPR_CORPORATE value."""
+    monkeypatch.delenv("OMNIGENT_OMPR_CORPORATE", raising=False)
+    assert creds.ompr_corporate_mode_enabled() is False
+    for truthy in ("1", "true", "TRUE", "yes", "on"):
+        monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", truthy)
+        assert creds.ompr_corporate_mode_enabled() is True
+    for falsy in ("", "0", "false", "no", "off"):
+        monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", falsy)
+        assert creds.ompr_corporate_mode_enabled() is False
+
+
+def test_corporate_mode_empty_catalog_never_falls_back_to_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corporate mode + empty/unreachable catalog → empty picker, no legacy fallback."""
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    monkeypatch.setattr(creds, "omniroute_combo_model_options", lambda: [])
+
+    def _forbidden(**_kwargs: object) -> object:
+        raise AssertionError(
+            "resolve_pi_native_provider must not run in OMPR corporate mode "
+            "when the combo catalog is empty"
+        )
+
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", _forbidden)
+    assert creds.pi_native_model_options() == []
+
+
+def test_legacy_fallback_survives_when_corporate_mode_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the gate, an empty catalog still falls back to the managed provider."""
+    monkeypatch.delenv("OMNIGENT_OMPR_CORPORATE", raising=False)
+    monkeypatch.setattr(creds, "omniroute_combo_model_options", lambda: [])
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://api.anthropic.com",
+        api="anthropic-messages",
+        model="claude-sonnet-4-6",
+        api_key="sk-secret",
+        auth_header=False,
+    )
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", lambda **_kw: provider)
+
+    options = creds.pi_native_model_options()
+
+    assert [option["id"] for option in options] == ["omnigent/claude-sonnet-4-6"]
+
+
+def _combo_options(*ids: str) -> list[dict[str, object]]:
+    """Picker-shaped combo options for the ids given."""
+    return [{"id": combo_id, "model": combo_id, "displayName": combo_id} for combo_id in ids]
+
+
+def test_corporate_selection_prefers_colotool_default() -> None:
+    """No explicit model → the colotool-default combo wins when present."""
+    selected = creds.select_ompr_corporate_combo(
+        None, _combo_options("Fable5-K", "colotool-default", "GPT5.3-SPARK")
+    )
+    assert selected == "colotool-default"
+
+
+def test_corporate_selection_uses_the_sole_combo_without_a_default() -> None:
+    """A single-combo catalog is unambiguous even without colotool-default."""
+    selected = creds.select_ompr_corporate_combo(None, _combo_options("COLOTOOL-PENSAR"))
+    assert selected == "COLOTOOL-PENSAR"
+
+
+def test_corporate_selection_validates_an_explicit_model() -> None:
+    """An explicit model must be a catalog member; it wins when valid."""
+    combos = _combo_options("colotool-default", "Fable5-K")
+    assert creds.select_ompr_corporate_combo("Fable5-K", combos) == "Fable5-K"
+    with pytest.raises(
+        creds.OmprComboCatalogError, match="Fable5-K.*not in the OmniRoute combo catalog"
+    ):
+        creds.select_ompr_corporate_combo("Fable5-K", _combo_options("colotool-default"))
+
+
+def test_corporate_selection_requires_a_non_empty_catalog() -> None:
+    """An empty or unreachable catalog aborts instead of launching model-less."""
+    with pytest.raises(creds.OmprComboCatalogError, match="combo catalog is empty or unreachable"):
+        creds.select_ompr_corporate_combo("Fable5-K", [])
+    with pytest.raises(creds.OmprComboCatalogError, match="combo catalog is empty or unreachable"):
+        creds.select_ompr_corporate_combo(None, [])
+
+
+def test_corporate_selection_rejects_an_ambiguous_catalog() -> None:
+    """Multiple combos, no default, no explicit model → abort, don't guess."""
+    with pytest.raises(creds.OmprComboCatalogError, match="no 'colotool-default'"):
+        creds.select_ompr_corporate_combo(None, _combo_options("Fable5-K", "GPT5.3-SPARK"))

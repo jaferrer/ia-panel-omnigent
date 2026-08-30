@@ -2154,8 +2154,10 @@ async def _auto_create_pi_terminal(
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
+            ompr_corporate_mode_enabled,
             pi_native_provider_launch,
             resolve_pi_native_provider,
+            select_ompr_corporate_combo,
         )
 
         # Provider-qualified picker values select one of the models rendered
@@ -2166,12 +2168,23 @@ async def _auto_create_pi_terminal(
             omniroute_combo_model_options,
         )
 
-        combo_ids = {str(option["id"]) for option in omniroute_combo_model_options()}
-        if spec_model is not None and spec_model in combo_ids:
-            pi_args.extend(omniroute_combo_launch_args(spec_model))
-            provider = None
+        combo_options = omniroute_combo_model_options()
+        provider = None
+        if ompr_corporate_mode_enabled():
+            # Corporate OMPR contract (OMNIGENT_OMPR_CORPORATE=1, injected
+            # by the ia-portal installer): OmniRoute's combo catalog is the
+            # ONLY model source. An empty/unreachable catalog or an unlisted
+            # explicit model raises OmprComboCatalogError, which aborts the
+            # launch — ompr is never started without --model, and the legacy
+            # managed-provider fallback never runs.
+            selected_combo = select_ompr_corporate_combo(spec_model, combo_options)
+            pi_args.extend(omniroute_combo_launch_args(selected_combo))
         else:
-            provider = resolve_pi_native_provider(model=spec_model)
+            combo_ids = {str(option["id"]) for option in combo_options}
+            if spec_model is not None and spec_model in combo_ids:
+                pi_args.extend(omniroute_combo_launch_args(spec_model))
+            else:
+                provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
             cred_env, cred_args = pi_native_provider_launch(
                 bridge_dir / "pi-agent",

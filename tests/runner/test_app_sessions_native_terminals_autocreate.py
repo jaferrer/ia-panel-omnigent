@@ -3302,3 +3302,225 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert "spec" not in captured, "a refused launch must not start a terminal"
 
     await fake_client.aclose()
+
+
+# ── OMPR corporate mode (fail-closed combo catalog launch contract) ─────────
+#
+# OMNIGENT_OMPR_CORPORATE=1 (injected by the ia-portal installer for
+# COLOTOOL) makes OmniRoute's combo catalog the only model source for a
+# pi-native launch: an empty/unreachable catalog or an unlisted explicit
+# model aborts the launch with a clear error — ompr is never started
+# without ``--model``, and the legacy managed-provider fallback never runs.
+
+
+@dataclass
+class _CorporatePiLaunchResult:
+    """Captured artifacts of one corporate-mode pi launch attempt."""
+
+    launched: bool
+    args: list[str] | None = None
+    error: BaseException | None = None
+
+
+async def _run_corporate_pi_launch(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    combos: list[dict[str, object]],
+    model_override: str | None = None,
+    corporate: bool = True,
+) -> _CorporatePiLaunchResult:
+    """Drive ``_auto_create_pi_terminal`` under the corporate combo contract.
+
+    Patches the binary, bridge root, combo catalog, and legacy resolver
+    (whose use is forbidden in corporate mode), then returns whether the
+    terminal launched, with which args, or the aborting error.
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    if corporate:
+        monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    else:
+        monkeypatch.delenv("OMNIGENT_OMPR_CORPORATE", raising=False)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials, "omniroute_combo_model_options", lambda: combos
+    )
+
+    if corporate:
+        def _forbidden(**_kwargs: object) -> object:
+            raise AssertionError(
+                "resolve_pi_native_provider must not run in OMPR corporate mode"
+            )
+
+        monkeypatch.setattr(pi_native_credentials, "resolve_pi_native_provider", _forbidden)
+    else:
+        # Legacy mode: no managed provider → Pi falls back to its own login.
+        monkeypatch.setattr(
+            pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: None
+        )
+
+    async def _fake_launch_config(**_kwargs: Any) -> _PiNativeLaunchConfig:
+        return _PiNativeLaunchConfig(
+            workspace=tmp_path,
+            server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            external_session_id=None,
+            model_override=model_override,
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._pi_native_launch_config", _fake_launch_config)
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            captured["spec"] = spec
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi:main",
+                metadata={"terminal_name": "pi", "session_key": "main", "running": True},
+            )
+
+    try:
+        await _auto_create_pi_terminal(
+            "5d1f0a9b8c7d6e4f3a2b1c0d9e8f7a6b",
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+    except BaseException as exc:  # noqa: BLE001 — the abort IS the result under test
+        return _CorporatePiLaunchResult(launched=False, error=exc)
+
+    return _CorporatePiLaunchResult(launched=True, args=list(captured["spec"].args))
+
+
+@pytest.mark.asyncio
+async def test_corporate_empty_combo_catalog_aborts_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corporate mode + empty catalog → clear abort, ompr never launched."""
+    from omnigent.pi_native_credentials import OmprComboCatalogError
+
+    result = await _run_corporate_pi_launch(tmp_path=tmp_path, monkeypatch=monkeypatch, combos=[])
+
+    assert not result.launched, "an empty combo catalog must not launch a terminal"
+    assert isinstance(result.error, OmprComboCatalogError)
+    assert "combo catalog is empty or unreachable" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_corporate_launch_selects_colotool_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No explicit model → launch with --omniroute --model colotool-default."""
+    combos = [
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Fable5-K"},
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "colotool-default"},
+    ]
+    result = await _run_corporate_pi_launch(tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos)
+
+    assert result.launched
+    assert result.args is not None
+    assert result.args[result.args.index("--model") + 1] == "colotool-default"
+    assert "--omniroute" in result.args
+
+
+@pytest.mark.asyncio
+async def test_corporate_launch_uses_the_sole_combo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A single-combo catalog is selected even without colotool-default."""
+    combos = [{"id": "COLOTOOL-PENSAR", "model": "COLOTOOL-PENSAR", "displayName": "COLOTOOL-PENSAR"}]
+    result = await _run_corporate_pi_launch(tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos)
+
+    assert result.launched
+    assert result.args is not None
+    assert result.args[result.args.index("--model") + 1] == "COLOTOOL-PENSAR"
+
+
+@pytest.mark.asyncio
+async def test_corporate_explicit_valid_model_launches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog-listed explicit model wins over colotool-default."""
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "colotool-default"},
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Fable5-K"},
+    ]
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos, model_override="Fable5-K"
+    )
+
+    assert result.launched
+    assert result.args is not None
+    assert result.args[result.args.index("--model") + 1] == "Fable5-K"
+
+
+@pytest.mark.asyncio
+async def test_corporate_explicit_model_outside_catalog_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model the catalog does not list aborts — no legacy provider, no launch."""
+    from omnigent.pi_native_credentials import OmprComboCatalogError
+
+    combos = [{"id": "colotool-default", "model": "colotool-default", "displayName": "colotool-default"}]
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos, model_override="GPT5.3-SPARK"
+    )
+
+    assert not result.launched, "an unlisted model must not launch a terminal"
+    assert isinstance(result.error, OmprComboCatalogError)
+    assert "GPT5.3-SPARK" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_corporate_ambiguous_catalog_without_default_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Multiple combos, no colotool-default, no explicit model → abort, don't guess."""
+    from omnigent.pi_native_credentials import OmprComboCatalogError
+
+    combos = [
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Fable5-K"},
+        {"id": "GPT5.3-SPARK", "model": "GPT5.3-SPARK", "displayName": "GPT5.3-SPARK"},
+    ]
+    result = await _run_corporate_pi_launch(tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos)
+
+    assert not result.launched
+    assert isinstance(result.error, OmprComboCatalogError)
+    assert "no 'colotool-default'" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_non_corporate_empty_catalog_still_launches_via_legacy_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the gate, an empty catalog keeps today's behavior: launch proceeds.
+
+    The legacy resolver is patched to return ``None`` (no managed provider),
+    which is the pre-corporate fallback: Pi launches with its own login.
+    """
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=[], corporate=False
+    )
+
+    assert result.launched, "legacy mode must keep launching on an empty catalog"

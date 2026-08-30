@@ -402,11 +402,109 @@ def omniroute_combo_launch_args(model: str) -> list[str]:
     return ["--omniroute", "--model", model]
 
 
+# ── OMPR corporate mode (fail-closed combo catalog contract) ────────────────
+#
+# Corporate OMPR deployments (ia-portal / COLOTOOL) inject
+# ``OMNIGENT_OMPR_CORPORATE=1`` so OmniRoute's combo catalog becomes the ONLY
+# model source above the gateway. Under the gate an empty or unreachable
+# catalog fails closed — the legacy managed-provider fallback never runs —
+# and a launch always carries an explicit ``--model`` combo id. With the
+# variable unset, non-corporate installs keep today's fallback behavior.
+
+#: Env var that turns on the corporate OMPR fail-closed contract.
+_OMPR_CORPORATE_ENV = "OMNIGENT_OMPR_CORPORATE"
+#: Combo id selected by default when no explicit model is pinned.
+_OMPR_CORPORATE_DEFAULT_COMBO = "colotool-default"
+#: Falsy spellings, matching the repo-wide env-boolean convention
+# (:func:`omnigent.process_logging.env_truthy`).
+_OMPR_CORPORATE_FALSY = frozenset({"", "0", "false", "no", "off"})
+
+
+def ompr_corporate_mode_enabled() -> bool:
+    """Whether the corporate OMPR fail-closed contract is active.
+
+    :returns: ``True`` when ``OMNIGENT_OMPR_CORPORATE`` holds a truthy value
+        (``1``, ``true``, ``yes``, ``on``, …); unset or falsy → ``False``.
+    """
+    return os.environ.get(_OMPR_CORPORATE_ENV, "").strip().lower() not in _OMPR_CORPORATE_FALSY
+
+
+class OmprComboCatalogError(ValueError):
+    """A corporate-mode launch cannot be satisfied by the OmniRoute combo catalog.
+
+    Raised (never swallowed into a fallback) when the catalog is empty or
+    unreachable, an explicit model is not a catalog member, or no default
+    can be chosen unambiguously.
+    """
+
+
+def select_ompr_corporate_combo(
+    spec_model: str | None,
+    combos: list[dict[str, object]],
+) -> str:
+    """Pick the combo id a corporate OMPR launch must use — or fail closed.
+
+    Selection rules, in order:
+
+    1. A non-empty catalog is REQUIRED — an empty or unreachable
+       ``GET /v1/models`` aborts the launch.
+    2. An explicit model (session ``/model`` override or spec pin) must be
+       a catalog member; valid → it wins, invalid → abort.
+    3. No explicit model → ``colotool-default`` when present.
+    4. No default and exactly one combo → that combo.
+    5. Otherwise → abort; never guess among multiple combos.
+
+    :param spec_model: Explicit model id requested for the launch, or ``None``.
+    :param combos: Picker-shaped options from
+        :func:`omniroute_combo_model_options`.
+    :returns: The selected combo id (always launches with ``--model``).
+    :raises OmprComboCatalogError: When no compliant combo can be selected.
+    """
+    combo_ids = [
+        combo_id
+        for combo_id in (str(option.get("id", "")).strip() for option in combos)
+        if combo_id
+    ]
+    if not combo_ids:
+        raise OmprComboCatalogError(
+            "OMPR corporate mode: the OmniRoute combo catalog is empty or "
+            "unreachable (GET /v1/models returned no combos); refusing to "
+            "launch Pi without --model"
+        )
+    if spec_model is not None:
+        if spec_model in combo_ids:
+            return spec_model
+        raise OmprComboCatalogError(
+            f"OMPR corporate mode: model {spec_model!r} is not in the OmniRoute "
+            f"combo catalog; available combos: {', '.join(combo_ids)}"
+        )
+    if _OMPR_CORPORATE_DEFAULT_COMBO in combo_ids:
+        return _OMPR_CORPORATE_DEFAULT_COMBO
+    if len(combo_ids) == 1:
+        return combo_ids[0]
+    raise OmprComboCatalogError(
+        "OMPR corporate mode: no explicit model, no 'colotool-default' combo, "
+        f"and the catalog lists {len(combo_ids)} combos; refusing to guess. "
+        f"Available combos: {', '.join(combo_ids)}"
+    )
+
+
 def pi_native_model_options() -> list[dict[str, object]]:
     """Return pre-launch Pi choices configured through ``omni setup``."""
     combos = omniroute_combo_model_options()
     if combos:
         return combos
+    if ompr_corporate_mode_enabled():
+        # Corporate OMPR contract: OmniRoute's combo catalog is the only
+        # model source. An empty or unreachable catalog surfaces as an empty
+        # picker — never as the legacy managed-provider fallback, which
+        # would expose a direct provider behind the gateway's back.
+        _LOGGER.warning(
+            "pi-native: OMPR corporate mode is on but the OmniRoute combo "
+            "catalog is empty or unreachable; the model picker stays empty "
+            "instead of falling back to the managed provider"
+        )
+        return []
 
     provider = resolve_pi_native_provider()
     if provider is None:
