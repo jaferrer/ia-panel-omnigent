@@ -444,9 +444,18 @@ def _omniroute_api_key() -> str | None:
     return None
 
 
-def _fetch_omniroute_models(base_url: str) -> dict[str, object]:
-    """Fetch OmniRoute's OpenAI-compatible model catalog."""
-    request = urllib.request.Request(f"{base_url.rstrip('/')}/v1/models")
+def _fetch_omniroute_combos(base_url: str) -> dict[str, object]:
+    """Fetch OmniRoute's own combo catalog.
+
+    Not the OpenAI-compatible ``/v1/models`` (also exposes combos, as
+    ``owned_by == "combo"`` fake models, for generic tooling) -- ``/v1/combos``
+    is OmniRoute's native endpoint and the one already driving the always-on
+    ``omniroute-combos`` pi extension in production, so this mirrors that
+    instead of introducing a second, divergent path (2026-08-30: verified
+    against a real deployment where /v1/models 200s but only /v1/combos
+    reflects the combos actually configured there).
+    """
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/v1/combos")
     api_key = _omniroute_api_key()
     if api_key:
         request.add_header("Authorization", f"Bearer {api_key}")
@@ -464,22 +473,22 @@ def omniroute_combo_model_options() -> list[dict[str, object]]:
         or os.environ.get("OMNIROUTE_URL", "http://127.0.0.1:20128")
     )
     try:
-        payload = _fetch_omniroute_models(base_url)
+        payload = _fetch_omniroute_combos(base_url)
     except (OSError, ValueError):
         return []
 
     data = payload.get("data", [])
     if not isinstance(data, list):
         return []
-    ids = sorted(
-        str(model.get("id", "")).strip()
-        for model in data
-        if isinstance(model, dict) and model.get("owned_by") == "combo"
+    names = sorted(
+        str(combo.get("name", "")).strip()
+        for combo in data
+        if isinstance(combo, dict)
     )
     return [
-        {"id": model_id, "model": model_id, "displayName": model_id}
-        for model_id in ids
-        if model_id and "/" not in model_id
+        {"id": name, "model": name, "displayName": name}
+        for name in names
+        if name
     ]
 
 

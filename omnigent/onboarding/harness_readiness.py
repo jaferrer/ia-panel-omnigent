@@ -434,14 +434,19 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
     if canonical in _PI_HARNESSES:
-        # pi has no CLI login — its only credential is an omnigent-managed
-        # provider (an API key / gateway, incl. one set from the UI). So the
-        # two-step signal is binary + provider: installed-but-no-provider is
-        # the yellow "needs-auth" state the setup dialog acts on.
+        # pi has no CLI login — its credential is either an omnigent-managed
+        # provider (an API key / gateway, incl. one set from the UI) OR an
+        # OmniRoute combo catalog (OMNIROUTE_API_KEY, corporate deployments).
+        # Two-step signal is binary + either credential: installed-but-neither
+        # is the yellow "needs-auth" state the setup dialog acts on.
         binary_state = _binary_availability_reason(PI_KEY)
         if binary_state is not True:
             return binary_state
-        return True if _family_provider_configured(PI_SURFACE) else "needs-auth"
+        if _family_provider_configured(PI_SURFACE):
+            return True
+        from omnigent.pi_native_credentials import pi_native_model_options
+
+        return True if pi_native_model_options() else "needs-auth"
     return _harness_availability_core(canonical)
 
 

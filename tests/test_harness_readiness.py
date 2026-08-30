@@ -81,6 +81,12 @@ def test_configured_harness_map_pi_installed_no_provider_needs_auth(
     """
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
     monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+    # Neither the omnigent-managed provider NOR an OmniRoute combo catalog is
+    # configured here — without this, the real omniroute_combo_model_options()
+    # would reach out over the network for a live answer.
+    import omnigent.pi_native_credentials as creds
+
+    monkeypatch.setattr(creds, "pi_native_model_options", lambda: [])
     cmap = hr.configured_harness_map()
     assert cmap.get("pi") == "needs-auth"
     assert cmap.get("pi-native") == "needs-auth"

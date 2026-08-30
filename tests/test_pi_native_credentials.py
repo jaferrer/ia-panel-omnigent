@@ -33,17 +33,15 @@ def _databricks_config() -> dict[str, object]:
 
 
 def test_omniroute_combo_options_filters_and_sorts(monkeypatch: pytest.MonkeyPatch) -> None:
-    """OmniRoute contributes only user-defined combo ids to the Pi picker."""
+    """OmniRoute contributes every configured combo, sorted, to the Pi picker."""
     monkeypatch.setenv("OMNIROUTE_URL", "http://127.0.0.1:20128")
     monkeypatch.setattr(
         creds,
-        "_fetch_omniroute_models",
+        "_fetch_omniroute_combos",
         lambda _url: {
             "data": [
-                {"id": "Zulu", "owned_by": "combo"},
-                {"id": "auto/best-coding", "owned_by": "combo"},
-                {"id": "provider/model", "owned_by": "provider"},
-                {"id": "Alpha", "owned_by": "combo"},
+                {"name": "Zulu"},
+                {"name": "Alpha"},
             ]
         },
     )
@@ -56,7 +54,7 @@ def test_omniroute_combo_options_filters_and_sorts(monkeypatch: pytest.MonkeyPat
 
 
 
-def test_fetch_omniroute_models_sends_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_omniroute_combos_sends_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
     """OmniRoute requires a Bearer key; silent 401 emptied the GUI combo list."""
     captured: dict[str, object] = {}
 
@@ -77,8 +75,8 @@ def test_fetch_omniroute_models_sends_authorization(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-test")
     monkeypatch.setattr(creds.urllib.request, "urlopen", fake_urlopen)
-    assert creds._fetch_omniroute_models("http://127.0.0.1:20128") == {"data": []}
-    assert captured["url"] == "http://127.0.0.1:20128/v1/models"
+    assert creds._fetch_omniroute_combos("http://127.0.0.1:20128") == {"data": []}
+    assert captured["url"] == "http://127.0.0.1:20128/v1/combos"
     assert captured["headers"].get("Authorization") == "Bearer sk-test"
 
 def test_omniroute_combo_launch_args() -> None:
@@ -2018,16 +2016,16 @@ def test_ompr_catalog_env_path_override_reads_installer_file(
     assert creds._omniroute_api_key() == "file-token"
 
 
-# Real-socket /v1/models gate: 401 without the correct Bearer, combos with it.
+# Real-socket /v1/combos gate: 401 without the correct Bearer, combos with it.
 
 
 def _make_bearer_gate_handler(expected_token: str):  # noqa: ANN202
-    """Build a real http.server handler that gates /v1/models on the Bearer."""
+    """Build a real http.server handler that gates /v1/combos on the Bearer."""
     from http.server import BaseHTTPRequestHandler
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 — http.server API
-            if self.path != "/v1/models":
+            if self.path != "/v1/combos":
                 self.send_response(404)
                 self.end_headers()
                 return
@@ -2041,10 +2039,8 @@ def _make_bearer_gate_handler(expected_token: str):  # noqa: ANN202
             body = json.dumps(
                 {
                     "data": [
-                        {"id": "colotool-default", "owned_by": "combo"},
-                        {"id": "Fable5-K", "owned_by": "combo"},
-                        {"id": "direct/model", "owned_by": "combo"},
-                        {"id": "plain-model", "owned_by": "openai"},
+                        {"name": "colotool-default"},
+                        {"name": "Fable5-K"},
                     ]
                 }
             ).encode("utf-8")
@@ -2061,7 +2057,7 @@ def _make_bearer_gate_handler(expected_token: str):  # noqa: ANN202
 
 
 def _local_bearer_models_server(expected_token: str):  # noqa: ANN202
-    """Serve a real local HTTP /v1/models that enforces the Bearer token."""
+    """Serve a real local HTTP /v1/combos that enforces the Bearer token."""
     import threading
     from contextlib import contextmanager
     from http.server import ThreadingHTTPServer
