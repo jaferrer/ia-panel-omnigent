@@ -2151,17 +2151,19 @@ async def _auto_create_pi_terminal(
     # terminal_launch_args, or when no usable provider is configured (Pi then
     # falls back to its own login). Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
+    from omnigent.pi_native_credentials import ompr_corporate_mode_enabled
+
+    ompr_corporate = ompr_corporate_mode_enabled()
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
-            ompr_corporate_mode_enabled,
             pi_native_provider_launch,
             resolve_pi_native_provider,
             select_ompr_corporate_combo,
         )
 
         # Provider-qualified picker values select one of the models rendered
-        # from the provider configured through ``omni setup``.
+        # from the provider configured by ``omni setup``.
         spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
         from omnigent.pi_native_credentials import (
             omniroute_combo_launch_args,
@@ -2170,7 +2172,7 @@ async def _auto_create_pi_terminal(
 
         combo_options = omniroute_combo_model_options()
         provider = None
-        if ompr_corporate_mode_enabled():
+        if ompr_corporate:
             # Corporate OMPR contract (OMNIGENT_OMPR_CORPORATE=1, injected
             # by the ia-portal installer): OmniRoute's combo catalog is the
             # ONLY model source. An empty/unreachable catalog or an unlisted
@@ -2217,6 +2219,13 @@ async def _auto_create_pi_terminal(
             command=pi_command,
             args=pi_args,
             env=pi_env,
+            # Corporate leak-prevention: the spawned ompr child must never see
+            # the ambient catalog credentials — its dispatch key comes from the
+            # ompr wrapper's own env file (OMPR_ENV_FILE, untouched here).
+            # env_unset is applied after env merging, so the strip is absolute.
+            env_unset=(
+                ["OMNIROUTE_API_KEY", "OMNIGENT_OMPR_CATALOG_ENV"] if ompr_corporate else []
+            ),
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,

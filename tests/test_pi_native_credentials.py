@@ -1902,3 +1902,247 @@ def test_corporate_selection_rejects_an_ambiguous_catalog() -> None:
     """Multiple combos, no default, no explicit model → abort, don't guess."""
     with pytest.raises(creds.OmprComboCatalogError, match="no 'colotool-default'"):
         creds.select_ompr_corporate_combo(None, _combo_options("Fable5-K", "GPT5.3-SPARK"))
+
+
+# ── OMPR corporate catalog credential (least-privilege Bearer source) ───────
+#
+# Corporate deployments must keep OMNIROUTE_API_KEY out of the spawned ompr
+# child's environment. The runner's catalog fetch therefore reads its Bearer
+# token from a protected, installer-written env file
+# (~/.omnigent/ompr-catalog.env, mode 0600) BEFORE any ambient source, so the
+# key never needs to live in the runner process env.
+
+
+def _write_protected_ompr_env_file(home: Path, content: str) -> Path:
+    """Write an installer-style 0600 OMPR catalog env file under ``home``."""
+    env_dir = home / ".omnigent"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    env_file = env_dir / "ompr-catalog.env"
+    env_file.write_text(content, encoding="utf-8")
+    env_file.chmod(0o600)
+    return env_file
+
+
+def test_omniroute_api_key_prefers_protected_ompr_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protected file wins over the ambient env token."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "ambient-token")
+    _write_protected_ompr_env_file(tmp_path, "OMNIROUTE_API_KEY=file-token\n")
+
+    assert creds._omniroute_api_key() == "file-token"
+
+
+def test_omniroute_api_key_reads_dedicated_catalog_token_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dedicated OMPR_CATALOG_TOKEN line is a valid least-privilege source."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    _write_protected_ompr_env_file(tmp_path, "OMPR_CATALOG_TOKEN=file-token\n")
+
+    assert creds._omniroute_api_key() == "file-token"
+
+
+def test_omniroute_api_key_falls_back_to_env_without_protected_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No protected file → the ambient env token keeps working (legacy installs)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "ambient-token")
+
+    assert creds._omniroute_api_key() == "ambient-token"
+
+
+def test_omniroute_api_key_warns_on_world_readable_catalog_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A world-readable catalog env file warns (group-readable does not)."""
+    import logging
+
+    env_file = _write_protected_ompr_env_file(tmp_path, "OMNIROUTE_API_KEY=file-token\n")
+    env_file.chmod(0o644)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.pi_native_credentials"):
+        assert creds._omniroute_api_key() == "file-token"
+    assert "ompr-catalog.env" in caplog.text
+
+    caplog.clear()
+    env_file.chmod(0o640)  # root:ompr service style — group read is intentional
+    with caplog.at_level(logging.WARNING, logger="omnigent.pi_native_credentials"):
+        assert creds._omniroute_api_key() == "file-token"
+    assert "world-accessible" not in caplog.text
+
+
+def test_ompr_catalog_env_path_override_reads_installer_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_OMPR_CATALOG_ENV points at the installer's file (e.g. /etc/ompr)."""
+    catalog_file = tmp_path / "omniroute-catalog.env"
+    catalog_file.write_text("OMNIROUTE_API_KEY=file-token\n", encoding="utf-8")
+    catalog_file.chmod(0o640)
+    monkeypatch.setenv("OMNIGENT_OMPR_CATALOG_ENV", str(catalog_file))
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "ambient-token")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)  # home default must NOT win
+
+    assert creds._omniroute_api_key() == "file-token"
+
+
+# Real-socket /v1/models gate: 401 without the correct Bearer, combos with it.
+
+
+def _make_bearer_gate_handler(expected_token: str):  # noqa: ANN202
+    """Build a real http.server handler that gates /v1/models on the Bearer."""
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 — http.server API
+            if self.path != "/v1/models":
+                self.send_response(404)
+                self.end_headers()
+                return
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {expected_token}":
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "missing or invalid bearer"}')
+                return
+            body = json.dumps(
+                {
+                    "data": [
+                        {"id": "colotool-default", "owned_by": "combo"},
+                        {"id": "Fable5-K", "owned_by": "combo"},
+                        {"id": "direct/model", "owned_by": "combo"},
+                        {"id": "plain-model", "owned_by": "openai"},
+                    ]
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:  # keep pytest output clean
+            pass
+
+    return Handler
+
+
+def _local_bearer_models_server(expected_token: str):  # noqa: ANN202
+    """Serve a real local HTTP /v1/models that enforces the Bearer token."""
+    import threading
+    from contextlib import contextmanager
+    from http.server import ThreadingHTTPServer
+
+    @contextmanager
+    def _server():
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_bearer_gate_handler(expected_token))
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{httpd.server_address[1]}"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    return _server()
+
+
+def test_omniroute_catalog_rejects_missing_bearer_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No credential source → the gate 401s → catalog reads as empty (no raise)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        monkeypatch.setenv("OMNIROUTE_URL", base_url)
+        assert creds.omniroute_combo_model_options() == []
+
+
+def test_omniroute_catalog_rejects_wrong_bearer_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A present-but-wrong Bearer also 401s → catalog reads as empty."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    _write_protected_ompr_env_file(tmp_path, "OMNIROUTE_API_KEY=wrong-token\n")
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        monkeypatch.setenv("OMNIROUTE_URL", base_url)
+        assert creds.omniroute_combo_model_options() == []
+
+
+def test_omniroute_catalog_accepts_bearer_from_protected_ompr_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protected file's token authenticates the real catalog fetch."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    _write_protected_ompr_env_file(tmp_path, "OMNIROUTE_API_KEY=secret-token\n")
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        monkeypatch.setenv("OMNIROUTE_URL", base_url)
+        options = creds.omniroute_combo_model_options()
+
+    assert [option["id"] for option in options] == ["Fable5-K", "colotool-default"]
+
+
+def test_omniroute_catalog_accepts_bearer_from_ambient_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy installs: an env-provided token still authenticates the fetch."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "secret-token")
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        monkeypatch.setenv("OMNIROUTE_URL", base_url)
+        options = creds.omniroute_combo_model_options()
+
+    assert [option["id"] for option in options] == ["Fable5-K", "colotool-default"]
+
+
+def test_omniroute_catalog_url_comes_from_catalog_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catalog env file carries OMNIROUTE_URL too — it wins over env/default.
+
+    The process env points at a dead port; only the file's URL reaches the
+    real local Bearer-gated server, proving endpoint + token both come from
+    the protected file.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIROUTE_URL", "http://127.0.0.1:1")  # dead port on purpose
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        _write_protected_ompr_env_file(
+            tmp_path, f"OMNIROUTE_API_KEY=secret-token\nOMNIROUTE_URL={base_url}\n"
+        )
+        options = creds.omniroute_combo_model_options()
+
+    assert [option["id"] for option in options] == ["Fable5-K", "colotool-default"]
+
+
+def test_corporate_gate_aborts_when_bearer_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corporate mode + 401 catalog → fail-closed abort chain preserved."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("OMNIROUTE_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+
+    with _local_bearer_models_server("secret-token") as base_url:
+        monkeypatch.setenv("OMNIROUTE_URL", base_url)
+        options = creds.omniroute_combo_model_options()
+
+    assert options == []
+    with pytest.raises(creds.OmprComboCatalogError, match="combo catalog is empty or unreachable"):
+        creds.select_ompr_corporate_combo(None, options)

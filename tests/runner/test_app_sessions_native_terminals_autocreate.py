@@ -3320,6 +3320,7 @@ class _CorporatePiLaunchResult:
     launched: bool
     args: list[str] | None = None
     error: BaseException | None = None
+    env_unset: list[str] | None = None
 
 
 async def _run_corporate_pi_launch(
@@ -3410,7 +3411,11 @@ async def _run_corporate_pi_launch(
     except BaseException as exc:  # noqa: BLE001 — the abort IS the result under test
         return _CorporatePiLaunchResult(launched=False, error=exc)
 
-    return _CorporatePiLaunchResult(launched=True, args=list(captured["spec"].args))
+    return _CorporatePiLaunchResult(
+        launched=True,
+        args=list(captured["spec"].args),
+        env_unset=list(captured["spec"].env_unset),
+    )
 
 
 @pytest.mark.asyncio
@@ -3524,3 +3529,44 @@ async def test_non_corporate_empty_catalog_still_launches_via_legacy_fallback(
     )
 
     assert result.launched, "legacy mode must keep launching on an empty catalog"
+
+
+@pytest.mark.asyncio
+async def test_corporate_launch_strips_omniroute_api_key_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corporate launches strip OMNIROUTE_API_KEY so ompr never sees the key.
+
+    The corporate catalog Bearer comes from the protected OMPR env file read
+    by omnigent itself; any ambient runner-env copy must not leak into the
+    spawned ompr child.
+    """
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "ambient-secret")
+    monkeypatch.setenv("OMNIGENT_OMPR_CATALOG_ENV", "/etc/ompr/omniroute-catalog.env")
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "colotool-default"}
+    ]
+    result = await _run_corporate_pi_launch(tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos)
+
+    assert result.launched
+    assert result.env_unset is not None
+    assert "OMNIROUTE_API_KEY" in result.env_unset
+    assert "OMNIGENT_OMPR_CATALOG_ENV" in result.env_unset
+
+
+@pytest.mark.asyncio
+async def test_non_corporate_launch_keeps_ambient_omniroute_api_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy launches keep today's env passthrough (no strip outside the gate)."""
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "ambient-secret")
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "colotool-default"}
+    ]
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos, corporate=False
+    )
+
+    assert result.launched
+    assert "OMNIROUTE_API_KEY" not in (result.env_unset or [])
+    assert "OMNIGENT_OMPR_CATALOG_ENV" not in (result.env_unset or [])

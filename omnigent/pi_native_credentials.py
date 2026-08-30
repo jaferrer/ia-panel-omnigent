@@ -368,15 +368,101 @@ class PiProviderConfig:
         )
 
 
+def _ompr_catalog_env_values() -> dict[str, str]:
+    """Parse the protected OMPR catalog env file (endpoint + Bearer token).
+
+    Corporate deployments install a least-privilege catalog credential file
+    (e.g. ``/etc/ompr/omniroute-catalog.env``, root:ompr 0640, holding
+    ``OMNIROUTE_API_KEY=<catalog-only key>`` and ``OMNIROUTE_URL=<gateway>``)
+    and point the omnigent server at it via ``OMNIGENT_OMPR_CATALOG_ENV``.
+    The token stays out of the runner process env, so it can never leak into
+    spawned terminal children (corporate launches additionally strip the
+    ambient vars from the child env). Distinct from ``OMPR_ENV_FILE`` — the
+    ompr wrapper's own full dispatch-key file — which omnigent never reads.
+
+    :returns: Parsed ``KEY=value`` pairs; ``{}`` when the path is unset,
+        missing, or unreadable — callers fail closed on that (no Bearer →
+        gateway 401 → empty catalog → corporate abort).
+    """
+    path_override = os.environ.get("OMNIGENT_OMPR_CATALOG_ENV", "").strip()
+    env_file = (
+        Path(path_override).expanduser()
+        if path_override
+        else Path.home().joinpath(".omnigent", "ompr-catalog.env")
+    )
+    try:
+        content = env_file.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in content.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip()] = value.strip().strip("\"'")
+    if not values:
+        return values
+    try:
+        file_mode = env_file.stat().st_mode & 0o777
+    except OSError:
+        file_mode = 0o600
+    if file_mode & 0o007:  # group-readable (0640, service group) is intentional
+        _LOGGER.warning(
+            "pi-native: %s is world-accessible (mode %o); the catalog token "
+            "file should not be readable by others",
+            env_file,
+            file_mode,
+        )
+    return values
+
+
+def _omniroute_api_key() -> str | None:
+    """Resolve the OmniRoute catalog Bearer token, least-privilege first.
+
+    Precedence:
+
+    1. The protected OMPR catalog env file (``OMNIGENT_OMPR_CATALOG_ENV``
+       path, else ``~/.omnigent/ompr-catalog.env``) — ``OMNIROUTE_API_KEY=``
+       or the dedicated ``OMPR_CATALOG_TOKEN=`` alias.
+    2. ``OMNIROUTE_API_KEY`` in the process env (legacy installs).
+    3. ``~/.env`` ``OMNIROUTE_API_KEY=`` line (parity with omniroute-combos.ts).
+    """
+    catalog_values = _ompr_catalog_env_values()
+    for key in ("OMNIROUTE_API_KEY", "OMPR_CATALOG_TOKEN"):
+        token = catalog_values.get(key, "")
+        if token:
+            return token
+    from_env = os.environ.get("OMNIROUTE_API_KEY", "").strip()
+    if from_env:
+        return from_env
+    try:
+        dotenv = Path.home().joinpath(".env").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in dotenv.splitlines():
+        if line.startswith("OMNIROUTE_API_KEY="):
+            return line.split("=", 1)[1].strip().strip("\"\'")
+    return None
+
+
 def _fetch_omniroute_models(base_url: str) -> dict[str, object]:
     """Fetch OmniRoute's OpenAI-compatible model catalog."""
-    with urllib.request.urlopen(f"{base_url.rstrip('/')}/v1/models", timeout=3) as response:
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/v1/models")
+    api_key = _omniroute_api_key()
+    if api_key:
+        request.add_header("Authorization", f"Bearer {api_key}")
+    with urllib.request.urlopen(request, timeout=3) as response:
         return json.load(response)
 
 
 def omniroute_combo_model_options() -> list[dict[str, object]]:
     """Return user-defined OmniRoute combos when the local gateway is live."""
-    base_url = os.environ.get("OMNIROUTE_URL", "http://127.0.0.1:20128")
+    # The protected catalog env file (when present) is the single source of
+    # both endpoint and Bearer token; process env and the 127.0.0.1 default
+    # remain the legacy fallbacks.
+    base_url = (
+        _ompr_catalog_env_values().get("OMNIROUTE_URL", "").strip()
+        or os.environ.get("OMNIROUTE_URL", "http://127.0.0.1:20128")
+    )
     try:
         payload = _fetch_omniroute_models(base_url)
     except (OSError, ValueError):
