@@ -136,3 +136,39 @@ def test_runner_env_preserves_claude_tool_search_flags() -> None:
 
     # Then
     assert {name: env.get(name) for name in _CLAUDE_TOOL_SEARCH_ENV} == _CLAUDE_TOOL_SEARCH_ENV
+
+
+def test_ompr_controls_survive_host_daemon_to_runner_boundary_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Corporate controls cross both env strips, but the catalog token does not.
+
+    The portal launcher exports the non-secret corporate flag and catalog-file
+    path to the host process. In remote/server mode they must survive
+    CLI→host-daemon→runner. ``OMNIROUTE_API_KEY`` is deliberately absent: the
+    runner reads the catalog Bearer from the protected file path, and the
+    spawned ``ompr`` child receives neither the key nor the path.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    monkeypatch.setenv("OMNIGENT_OMPR_CATALOG_ENV", "/etc/ompr/omniroute-catalog.env")
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "catalog-secret-must-not-cross")
+
+    daemon_env = _build_host_daemon_env(server_url=_REMOTE_SERVER_URL)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_ompr",
+        binding_token="binding-ompr",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    controls = {
+        "OMNIGENT_OMPR_CORPORATE": "1",
+        "OMNIGENT_OMPR_CATALOG_ENV": "/etc/ompr/omniroute-catalog.env",
+    }
+    assert {name: daemon_env.get(name) for name in controls} == controls
+    assert {name: runner_env.get(name) for name in controls} == controls
+    assert "OMNIROUTE_API_KEY" not in daemon_env
+    assert "OMNIROUTE_API_KEY" not in runner_env

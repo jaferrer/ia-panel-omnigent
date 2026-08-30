@@ -425,6 +425,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # OMNIGENT_DATABASE_URI is intentionally NOT here — it may embed a
         # DB password, so it's propagated to the local daemon only (see
         # cli._ensure_host_daemon), never to a (possibly hosted) runner.
+        # Corporate OMPR routing controls are non-secret: the portal exports
+        # these to the server so the runner can enforce the fail-closed combo
+        # catalog contract. The catalog Bearer itself stays in the protected
+        # file named by OMNIGENT_OMPR_CATALOG_ENV and is intentionally NOT
+        # allowlisted here (OMNIROUTE_API_KEY must never cross host→runner).
+        "OMNIGENT_OMPR_CORPORATE",
+        "OMNIGENT_OMPR_CATALOG_ENV",
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
         # Auth provider selection. The env-unset default was flipped
