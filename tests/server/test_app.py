@@ -1068,6 +1068,43 @@ def test_ensure_default_native_agents_corporate_mode_seeds_only_pi(
             assert seeded is None, f"{agent.agent_name} must NOT seed under corporate mode"
 
 
+def test_ensure_default_native_agents_corporate_mode_prunes_existing(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Turning corporate mode on for an account seeded BEFORE the flag existed
+    must retroactively remove the disallowed harnesses, not just skip
+    reseeding them going forward -- the seeding loop only ever adds rows, so
+    without an explicit prune an already-seeded Claude/Codex/etc. would keep
+    appearing in the picker forever.
+    """
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    # Legacy (pre-corporate) run: everything seeds normally.
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+    for agent in NATIVE_CODING_AGENTS:
+        assert seed_stores.agent_store.get_by_name(agent.agent_name) is not None
+
+    # Corporate mode turns on for this same, already-seeded account.
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    for agent in NATIVE_CODING_AGENTS:
+        seeded = seed_stores.agent_store.get_by_name(agent.agent_name)
+        if agent.key == "pi":
+            assert seeded is not None, "pi must survive the prune"
+        else:
+            assert seeded is None, f"{agent.agent_name} must be pruned once corporate mode turns on"
+
+
 def test_ensure_default_acp_agents_seeds_configured_agent(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:

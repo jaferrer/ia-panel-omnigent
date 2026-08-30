@@ -659,6 +659,18 @@ def _ensure_default_native_agents(
     # only the ``pi`` entry (whose catalog is itself restricted to OmniRoute
     # combos) gets seeded. Unset/falsy env keeps the legacy behavior below.
     corporate = ompr_corporate_mode_enabled()
+    if corporate:
+        # This function only ever ADDS rows (an idempotent "ensure exists"),
+        # so an account that already had Claude/Codex/etc. seeded from a run
+        # BEFORE corporate mode was turned on would keep seeing them forever
+        # even after the skip below starts. Prune them here so flipping the
+        # flag actually takes effect for existing accounts, not just fresh
+        # ones.
+        from omnigent.db.utils import builtin_agent_id
+
+        for agent in NATIVE_CODING_AGENTS:
+            if agent.key != "pi":
+                agent_store.delete(builtin_agent_id(agent.agent_name))
     for agent in NATIVE_CODING_AGENTS:
         if corporate and agent.key != "pi":
             continue
