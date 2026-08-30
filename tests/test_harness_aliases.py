@@ -125,3 +125,15 @@ def test_native_terminal_name(harness: str | None, expected: str | None) -> None
     wrong pane or silently skip a harness.
     """
     assert native_terminal_name(harness) == expected
+
+
+def test_ompr_alias_resolves_to_pi_native() -> None:
+    from omnigent.harness_aliases import (
+        canonicalize_harness,
+        is_native_harness,
+        native_terminal_name,
+    )
+
+    assert canonicalize_harness("ompr") == "pi-native"
+    assert is_native_harness("ompr") is True
+    assert native_terminal_name("ompr") == "pi"

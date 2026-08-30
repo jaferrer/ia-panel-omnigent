@@ -51,7 +51,7 @@ from omnigent.pi_native_bridge import bridge_dir_for_session_id
 _logger = logging.getLogger(__name__)
 
 
-_DEFAULT_PI_COMMAND = "pi"
+_DEFAULT_PI_COMMAND = "ompr"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
 # Deprecated alias — remove in v0.8.0 (read via the legacy branch below, which warns).
 _LEGACY_HARNESS_PI_PATH_ENV = "HARNESS_PI_PATH"
@@ -130,8 +130,8 @@ def resolve_pi_executable(
     resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
-            "Native Pi requires the 'pi' CLI on PATH. Install Pi, add it to PATH, "
-            "or install it with: npm install -g @earendil-works/pi-coding-agent. "
+            "Native Pi requires the 'ompr' wrapper on PATH. "
+            "Install it with: ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr "
             f"You can also set {_PI_PATH_ENV}=/path/to/pi."
         )
     return resolved
@@ -183,6 +183,12 @@ def pi_supports_approve(executable: str) -> bool:
     :param executable: Resolved path to the Pi CLI.
     :returns: ``True`` iff the installed Pi version is >= 0.79.0.
     """
+    # Launches routed through the ompr wrapper run the oh-my-pi fork, which
+    # reports its own (higher, unrelated) version and rejects --approve.
+    # Never emit the flag for the wrapper; explicit OMNIGENT_PI_PATH
+    # pointing at a real Pi keeps the version gate.
+    if os.path.basename(executable).startswith("ompr"):
+        return False
     ver = pi_version(executable)
     if ver is None:
         return False

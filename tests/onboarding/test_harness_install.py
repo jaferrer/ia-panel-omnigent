@@ -46,7 +46,6 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     "key,binary,package",
     [
         (OPENAI_FAMILY, "codex", "@openai/codex"),
-        (hi.PI_KEY, "pi", "@earendil-works/pi-coding-agent"),
         (hi.QWEN_KEY, "qwen", "@qwen-code/qwen-code"),
     ],
 )
@@ -418,7 +417,7 @@ def test_unknown_key_has_no_spec_and_is_not_installed() -> None:
     [
         ("claude-native", "claude"),
         ("codex-native", "codex"),
-        ("pi", "pi"),
+        ("pi", "ompr"),
         # Native Cursor wraps the cursor-agent CLI (distinct from the SDK
         # ``cursor`` harness, which needs no binary — see the test below).
         ("cursor-native", "cursor-agent"),
@@ -464,7 +463,7 @@ def test_setup_hint_for_native_kiro_points_at_vendor_installer(harness: str) -> 
     assert "omni setup" not in hint
 
 
-@pytest.mark.parametrize("harness", ["codex", "pi", "claude-sdk", None])
+@pytest.mark.parametrize("harness", ["codex", "claude-sdk", None])
 def test_setup_hint_defaults_to_omnigent_setup(harness: str | None) -> None:
     """Harnesses whose CLI ``omni setup`` installs (npm CLIs) — and the
     SDK / unknown / ``None`` cases — route to the ``omni setup`` hint.
@@ -519,8 +518,8 @@ def test_missing_harness_cli_absent_returns_spec(monkeypatch: pytest.MonkeyPatch
     assert spec is not None
     # The returned spec carries the binary + npm package the dispatch error
     # surfaces to the orchestrator/human.
-    assert spec.binary == "pi"
-    assert spec.package == "@earendil-works/pi-coding-agent"
+    assert spec.binary == "ompr"
+    assert spec.package is None
 
 
 def test_missing_harness_cli_none_for_sdk_harness(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1281,7 +1280,6 @@ def test_ui_setup_steps_generic_for_non_installable() -> None:
         (hi.KIMI_KEY, "0.7.0", None),
         (ANTHROPIC_FAMILY, "2.1.161", None),
         (OPENAI_FAMILY, "0.137.0", None),
-        (hi.PI_KEY, "0.79.0", None),
         (hi.QWEN_KEY, "0.18.1", None),
         (hi.GOOSE_KEY, "1.38.0", None),
         (hi.HERMES_KEY, "0.17.0", None),
@@ -1334,7 +1332,6 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
         hi.KIMI_KEY,
         ANTHROPIC_FAMILY,
         OPENAI_FAMILY,
-        hi.PI_KEY,
         hi.QWEN_KEY,
         hi.GOOSE_KEY,
         hi.HERMES_KEY,

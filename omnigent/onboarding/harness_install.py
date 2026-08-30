@@ -195,13 +195,19 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # to "no spawn gate" instead of blocking every codex launch.
         min_version=_CODEX_MIN_VERSION,
     ),
+    # Pi harnesses always launch the ``ompr`` wrapper (oh-my-pi fork with
+    # OmniRoute combo filtering); a bare vendor ``pi`` CLI is never the
+    # default, so readiness/installation gate on the wrapper binary.
     PI_KEY: HarnessInstallSpec(
         "Pi",
-        "pi",
-        "@earendil-works/pi-coding-agent",
-        # The ``--approve`` / non-interactive trust override requires
-        # ``pi >= 0.79.0``; older CLIs would prompt mid-session.
-        min_version=_PI_MIN_VERSION,
+        "ompr",
+        None,
+        install_command=(
+            "bash",
+            "-c",
+            "ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr",
+        ),
+        install_hint="ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr",
     ),
     # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a

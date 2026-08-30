@@ -28,7 +28,20 @@ PI_NATIVE_CONFIG_ENV_VAR = "OMNIGENT_PI_NATIVE_CONFIG"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "pi-native"
 _CONFIG_FILE = "config.json"
 _EXTENSION_FILE = "omnigent_pi_native_extension.js"
+_EXTENSION_WRAPPER_FILE = "omnigent_pi_native_extension.mjs"
 _EXTENSION_PACKAGE = "omnigent.resources.pi_native"
+# omp's loadLegacyPiModule rewrites bare CJS `module.exports = function` into
+# an empty ESM ModuleNamespace. Ship a tiny ESM wrapper that createRequire()s
+# the packaged CJS body so session_start/message_end actually register.
+_EXTENSION_WRAPPER_SOURCE = """import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const require = createRequire(import.meta.url);
+export default require(
+  join(dirname(fileURLToPath(import.meta.url)), "omnigent_pi_native_extension.js"),
+);
+"""
 _INBOX_DIR = "inbox"
 _SESSIONS_DIR = "sessions"
 
@@ -111,8 +124,12 @@ def pi_session_dir(bridge_dir: Path) -> Path:
 
 
 def extension_path(bridge_dir: Path) -> Path:
-    """Return the generated Pi extension path for *bridge_dir*."""
-    return bridge_dir / _EXTENSION_FILE
+    """Return the generated Pi extension path for *bridge_dir*.
+
+    Returns the ESM wrapper (``.mjs``). omp loads that; the wrapper
+    createRequire()s the sibling CJS body that carries the real handlers.
+    """
+    return bridge_dir / _EXTENSION_WRAPPER_FILE
 
 
 def config_path(bridge_dir: Path) -> Path:
@@ -285,7 +302,8 @@ def write_extension_files(
         "tools": tools or [],
     }
     _atomic_json(config_path(bridge_dir), payload)
-    _atomic_text(extension_path(bridge_dir), _extension_source())
+    _atomic_text(bridge_dir / _EXTENSION_FILE, _extension_source())
+    _atomic_text(extension_path(bridge_dir), _EXTENSION_WRAPPER_SOURCE)
     return extension_path(bridge_dir), config_path(bridge_dir)
 
 

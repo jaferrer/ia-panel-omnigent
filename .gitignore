@@ -86,3 +86,6 @@ omnigent/server/static/web-ui/
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
 web/package-lock.json
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/

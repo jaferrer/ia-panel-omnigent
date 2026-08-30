@@ -724,6 +724,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "native-opencode": "opencode-native",
         "native-pi": "pi-native",
         "native-qwen": "qwen-native",
+        "ompr": "pi-native",
         "opencode": "opencode-native",
         "openai-agents-sdk": "openai-agents",
         "qwen-code": "qwen",

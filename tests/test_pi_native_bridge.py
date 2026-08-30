@@ -365,3 +365,23 @@ def test_inject_relay_into_config_noops_when_config_absent(tmp_path: Path) -> No
     bridge_dir = tmp_path / "missing"
     bridge_dir.mkdir()
     assert pi_native_bridge.inject_relay_into_config(bridge_dir, "http://x", "tok") is False
+
+
+def test_write_extension_files_emits_esm_wrapper(tmp_path: Path) -> None:
+    """omp cannot load bare CJS factories; bridge must emit an ESM wrapper."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    ext, _cfg = pi_native_bridge.write_extension_files(
+        bridge_dir,
+        session_id="conv_test",
+        server_url="http://127.0.0.1:6767",
+        conversation_url="http://127.0.0.1:6767/c/conv_test",
+    )
+    assert ext.name.endswith(".mjs")
+    assert ext.exists()
+    cjs = bridge_dir / "omnigent_pi_native_extension.js"
+    assert cjs.exists()
+    wrapper = ext.read_text(encoding="utf-8")
+    assert "createRequire" in wrapper
+    assert "omnigent_pi_native_extension.js" in wrapper
+    assert "export default" in wrapper

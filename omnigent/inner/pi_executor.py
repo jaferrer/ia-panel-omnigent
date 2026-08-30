@@ -581,8 +581,10 @@ module.exports = function(pi) {{
 
 
 def _find_pi_cli() -> str | None:
-    """Find the ``pi`` CLI on PATH."""
-    return shutil.which("pi")
+    """Find the ``ompr`` wrapper on PATH (Pi harnesses always go through
+    ``ompr`` so OmniRoute combo filtering applies; bare ``pi`` is never
+    the default)."""
+    return shutil.which("ompr")
 
 
 # ---------------------------------------------------------------------------
@@ -1680,8 +1682,8 @@ class PiExecutor(Executor):
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
             raise ImportError(
-                "PiExecutor requires the 'pi' CLI on PATH. "
-                "Install it with: npm install -g @earendil-works/pi-coding-agent"
+                "PiExecutor requires the 'ompr' wrapper on PATH. "
+                "Install it with: ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr"
             )
         self._pi_path = resolved_pi
         self._cwd = cwd

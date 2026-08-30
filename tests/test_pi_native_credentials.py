@@ -54,6 +54,33 @@ def test_omniroute_combo_options_filters_and_sorts(monkeypatch: pytest.MonkeyPat
     ]
 
 
+
+
+def test_fetch_omniroute_models_sends_authorization(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OmniRoute requires a Bearer key; silent 401 emptied the GUI combo list."""
+    captured: dict[str, object] = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"data": []}'
+
+    def fake_urlopen(request, timeout=3):  # noqa: ARG001
+        captured["headers"] = dict(request.header_items())
+        captured["url"] = request.full_url
+        return _Resp()
+
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-test")
+    monkeypatch.setattr(creds.urllib.request, "urlopen", fake_urlopen)
+    assert creds._fetch_omniroute_models("http://127.0.0.1:20128") == {"data": []}
+    assert captured["url"] == "http://127.0.0.1:20128/v1/models"
+    assert captured["headers"].get("Authorization") == "Bearer sk-test"
+
 def test_omniroute_combo_launch_args() -> None:
     """A combo selected in the GUI launches Pi through its OmniRoute extension."""
     assert creds.omniroute_combo_launch_args("Fable5-WA") == [
