@@ -650,8 +650,18 @@ def _ensure_default_native_agents(
     :param agent_cache: Cache for loaded agent specs.
     """
     from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+    from omnigent.pi_native_credentials import ompr_corporate_mode_enabled
 
+    # Corporate OMPR contract: OmniRoute becomes the single, admin-managed
+    # point of model/provider access (see pi_native_credentials.py). Seeding
+    # Claude/Codex/etc. as pickable harnesses here would let a user reach a
+    # provider directly with their own credentials, bypassing that gate — so
+    # only the ``pi`` entry (whose catalog is itself restricted to OmniRoute
+    # combos) gets seeded. Unset/falsy env keeps the legacy behavior below.
+    corporate = ompr_corporate_mode_enabled()
     for agent in NATIVE_CODING_AGENTS:
+        if corporate and agent.key != "pi":
+            continue
         provider = native_provider_for_key(agent.key)
         if provider is None:
             raise OmnigentError(

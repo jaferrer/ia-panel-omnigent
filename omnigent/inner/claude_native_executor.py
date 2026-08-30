@@ -22,6 +22,7 @@ from omnigent.claude_native_bridge import (
     read_claude_status_model,
     read_launch_model,
     read_model_env,
+    read_transcript_path,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -74,6 +75,9 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
+        # Gates the one-time transcript-discovery wait in ``run_turn`` (see
+        # ``_await_transcript_discovery``) to the session's first turn only.
+        self._transcript_wait_done = False
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -171,6 +175,9 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's aliases / custom slot; a
         # bare catalog id is ignored and the pane keeps its old model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        if not self._transcript_wait_done:
+            self._transcript_wait_done = True
+            await self._await_transcript_discovery()
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
@@ -206,6 +213,38 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    async def _await_transcript_discovery(
+        self, timeout_s: float = 1.0, poll_interval_s: float = 0.05
+    ) -> None:
+        """
+        Wait briefly for the transcript forwarder to discover this
+        session's transcript, before the session's first message
+        reaches Claude.
+
+        Claude's hook write of ``transcript_path`` into bridge state and
+        this executor's own tmux-prompt-ready gate (inside
+        :func:`inject_user_message`) both wait on the same Claude Code
+        boot sequence but are otherwise unordered (see
+        ``claude_native_forwarder._ensure_state_for_transcript``):
+        without this wait, a fast first message can be typed and
+        answered before the forwarder ever discovers the transcript, so
+        the opening exchange sits behind the poller's discovery delay —
+        already visible in the raw terminal, missing/late in the
+        mirrored web chat.
+
+        Fails open: gives up silently after *timeout_s* so a hook that
+        never fires can never block a user's message indefinitely.
+
+        :param timeout_s: Maximum seconds to wait.
+        :param poll_interval_s: Delay between polls.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout_s
+        while read_transcript_path(self._bridge_dir) is None:
+            if loop.time() >= deadline:
+                return
+            await asyncio.sleep(poll_interval_s)
 
     def _reap_failed_turn(self) -> str | None:
         """Kill the Claude pane before a delivery timeout becomes ``failed``."""

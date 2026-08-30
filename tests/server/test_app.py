@@ -1039,6 +1039,35 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+def test_ensure_default_native_agents_corporate_mode_seeds_only_pi(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    OMNIGENT_OMPR_CORPORATE=1 must seed ``pi`` only, no other native harness.
+
+    OmniRoute becomes the single, admin-managed point of model/provider
+    access under this contract (pi_native_credentials.py); seeding
+    Claude/Codex/etc. as pickable harnesses would let a user reach a
+    provider directly with their own credentials, bypassing that gate.
+    """
+    from omnigent.native_coding_agents import NATIVE_CODING_AGENTS
+
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+
+    server_app._ensure_default_native_agents(
+        seed_stores.agent_store,
+        seed_stores.artifact_store,
+        seed_stores.agent_cache,
+    )
+
+    for agent in NATIVE_CODING_AGENTS:
+        seeded = seed_stores.agent_store.get_by_name(agent.agent_name)
+        if agent.key == "pi":
+            assert seeded is not None, "pi must still seed under corporate mode"
+        else:
+            assert seeded is None, f"{agent.agent_name} must NOT seed under corporate mode"
+
+
 def test_ensure_default_acp_agents_seeds_configured_agent(
     seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
 ) -> None:
