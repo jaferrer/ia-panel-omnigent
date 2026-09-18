@@ -2157,6 +2157,9 @@ async def _auto_create_pi_terminal(
     credential_warning: str | None = None
     if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
         from omnigent.pi_native_credentials import (
+            ompr_catalog_options,
+            ompr_gateway_config,
+            ompr_gateway_provider,
             pi_native_provider_launch,
             resolve_pi_native_provider,
             select_ompr_corporate_combo,
@@ -2170,9 +2173,40 @@ async def _auto_create_pi_terminal(
             omniroute_combo_model_options,
         )
 
-        combo_options = omniroute_combo_model_options()
+        gateway = ompr_gateway_config() if ompr_corporate else None
+        combo_options = (
+            ompr_catalog_options()
+            if ompr_corporate
+            else omniroute_combo_model_options()
+        )
         provider = None
-        if ompr_corporate:
+        if ompr_corporate and gateway is not None:
+            # Corporate gateway mode (OMNIGENT_OMPR_GATEWAY_URL set): the
+            # ia-panel gateway is the ONLY LLM entry. The catalog is the
+            # credential-scoped GET /v1/models, and Pi launches as an
+            # openai-completions provider holding the device credential —
+            # never with --omniroute.
+            selected_combo = select_ompr_corporate_combo(spec_model, combo_options)
+            gateway_provider = ompr_gateway_provider(
+                gateway[0],
+                gateway[1],
+                [str(option["id"]) for option in combo_options],
+                selected_combo,
+            )
+            cred_env, cred_args = pi_native_provider_launch(
+                bridge_dir / "pi-agent",
+                gateway_provider,
+                selection=None,
+            )
+            pi_env.update(cred_env)
+            pi_args.extend(cred_args)
+            # An unroutable model leaves Pi unable to select it, which looks
+            # like a silent hang; prefer that notice over the credential one
+            # since it names the model the user actually picked.
+            credential_warning = (
+                gateway_provider.unroutable_model_warning() or gateway_provider.credential_warning
+            )
+        elif ompr_corporate:
             # Corporate OMPR contract (OMNIGENT_OMPR_CORPORATE=1, injected
             # by the ia-portal installer): OmniRoute's combo catalog is the
             # ONLY model source. An empty/unreachable catalog or an unlisted

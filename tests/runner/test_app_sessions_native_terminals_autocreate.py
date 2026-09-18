@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -3570,3 +3571,196 @@ async def test_non_corporate_launch_keeps_ambient_omniroute_api_key(
     assert result.launched
     assert "OMNIROUTE_API_KEY" not in (result.env_unset or [])
     assert "OMNIGENT_OMPR_CATALOG_ENV" not in (result.env_unset or [])
+
+# ── OMPR corporate gateway mode (ia-panel gateway as the only LLM entry) ──
+#
+# With OMNIGENT_OMPR_GATEWAY_URL set, the corporate launch selects the
+# combo from the gateway catalog and writes an ia-panel provider
+# (models.json with baseUrl …/v1, authHeader, the device credential) —
+# never --omniroute.
+
+
+async def _run_gateway_pi_launch(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    combos: list[dict[str, object]],
+    model_override: str | None = None,
+    gateway_token: str = "device-token",
+) -> _CorporatePiLaunchResult:
+    """Drive ``_auto_create_pi_terminal`` under corporate gateway mode.
+
+    Stubs the panel ``GET /v1/models`` fetch (no network) and points the
+    bridge root at ``tmp_path`` so the written ``models.json`` is
+    inspectable, then delegates to the corporate helper (which asserts the
+    legacy resolver never runs).
+    """
+    import omnigent.pi_native as pi_native
+    import omnigent.pi_native_bridge as pi_native_bridge
+    import omnigent.pi_native_credentials as pi_native_credentials
+
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path / "pi-bridge")
+    monkeypatch.setattr(pi_native, "resolve_pi_executable", lambda: "pi")
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "_fetch_panel_gateway_models",
+        lambda _url, _token: {
+            "data": [{"id": str(option["id"])} for option in combos]
+        },
+    )
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "https://panel.example.lab")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", gateway_token)
+    return await _run_corporate_pi_launch(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        combos=combos,
+        model_override=model_override,
+        corporate=True,
+    )
+
+
+def _gateway_models_json(tmp_path: Path) -> dict[str, object]:
+    """Read the models.json the gateway launch wrote into the managed dir."""
+    from omnigent.pi_native_bridge import bridge_dir_for_session_id
+
+    agent_dir = (
+        tmp_path
+        / "pi-bridge"
+        / bridge_dir_for_session_id("5d1f0a9b8c7d6e4f3a2b1c0d9e8f7a6b").name
+        / "pi-agent"
+    )
+    return json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+
+
+@pytest.mark.asyncio
+async def test_gateway_launch_writes_panel_provider_without_omniroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gateway mode: --provider ia-panel --model, models.json holds the credential."""
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "X"},
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Y"},
+    ]
+    result = await _run_gateway_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos
+    )
+
+    assert result.launched, f"gateway launch must proceed, got {result.error!r}"
+    assert result.args is not None
+    assert "--omniroute" not in result.args
+    assert result.args[result.args.index("--provider") + 1] == "ia-panel"
+    assert result.args[result.args.index("--model") + 1] == "colotool-default"
+    models = _gateway_models_json(tmp_path)
+    payload = models["providers"]["ia-panel"]  # type: ignore[index]
+    assert payload["baseUrl"] == "https://panel.example.lab/v1"  # type: ignore[index]
+    assert payload["authHeader"] is True  # type: ignore[index]
+    assert payload["apiKey"] == "device-token"  # type: ignore[index]
+    assert sorted(m["id"] for m in payload["models"]) == [  # type: ignore[index]
+        "Fable5-K",
+        "colotool-default",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_launch_explicit_combo_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog-listed explicit model wins over the default in gateway mode."""
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "X"},
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Y"},
+    ]
+    result = await _run_gateway_pi_launch(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        combos=combos,
+        model_override="Fable5-K",
+    )
+
+    assert result.launched
+    assert result.args is not None
+    assert "--omniroute" not in result.args
+    assert result.args[result.args.index("--model") + 1] == "Fable5-K"
+
+
+@pytest.mark.asyncio
+async def test_gateway_launch_explicit_model_outside_catalog_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unlisted explicit model aborts the gateway launch, listing combos."""
+    from omnigent.pi_native_credentials import OmprComboCatalogError
+
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "X"},
+    ]
+    result = await _run_gateway_pi_launch(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        combos=combos,
+        model_override="GPT5.3-SPARK",
+    )
+
+    assert not result.launched
+    assert isinstance(result.error, OmprComboCatalogError)
+    assert "GPT5.3-SPARK" in str(result.error)
+    assert "colotool-default" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_gateway_launch_revoked_credential_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 401 from the gateway catalog aborts the launch (no provider written)."""
+    import omnigent.pi_native_credentials as pi_native_credentials
+    from omnigent.pi_native_credentials import OmprComboCatalogError
+
+    def _revoked(_url: str, _token: str) -> dict[str, object]:
+        raise urllib.error.HTTPError(
+            "https://panel.example.lab/v1/models",
+            401,
+            "Unauthorized",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=None,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(
+        pi_native_credentials, "_fetch_panel_gateway_models", _revoked
+    )
+    monkeypatch.setattr(
+        pi_native_credentials,
+        "omniroute_combo_model_options",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("OmniRoute-direct path must not run in gateway mode")
+        ),
+    )
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "https://panel.example.lab")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "revoked-token")
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=[], corporate=True
+    )
+
+    assert not result.launched
+    assert isinstance(result.error, OmprComboCatalogError)
+    assert "credential revoked" in str(result.error)
+
+
+@pytest.mark.asyncio
+async def test_corporate_non_gateway_launch_keeps_omniroute_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a gateway URL the corporate launch is --omniroute --model, byte-for-byte."""
+    monkeypatch.delenv("OMNIGENT_OMPR_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("OMNIGENT_OMPR_GATEWAY_TOKEN", raising=False)
+    combos = [
+        {"id": "colotool-default", "model": "colotool-default", "displayName": "X"},
+    ]
+    result = await _run_corporate_pi_launch(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, combos=combos
+    )
+
+    assert result.launched
+    assert result.args is not None
+    assert "--omniroute" in result.args
+    assert "--provider" not in result.args
+    assert result.args[result.args.index("--model") + 1] == "colotool-default"

@@ -429,9 +429,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # these to the server so the runner can enforce the fail-closed combo
         # catalog contract. The catalog Bearer itself stays in the protected
         # file named by OMNIGENT_OMPR_CATALOG_ENV and is intentionally NOT
-        # allowlisted here (OMNIROUTE_API_KEY must never cross host→runner).
+        # allowlisted here (OMNIROUTE_API_KEY must never cross host→runner,
+        # and neither must OMNIGENT_OMPR_GATEWAY_TOKEN — the runner reads it
+        # from that same protected file).
         "OMNIGENT_OMPR_CORPORATE",
         "OMNIGENT_OMPR_CATALOG_ENV",
+        "OMNIGENT_OMPR_GATEWAY_URL",
+        "OMNIGENT_OMPR_DEFAULT_COMBO",
         "OMNIGENT_CONFIG_HOME",
         "OMNIGENT_DATA_DIR",
         # Auth provider selection. The env-unset default was flipped

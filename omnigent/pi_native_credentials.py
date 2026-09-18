@@ -14,6 +14,13 @@ mirroring how codex-native routes through the Databricks AI Gateway.
 
 The managed config dir is per-session (like codex-native's managed
 ``CODEX_HOME``), so this never mutates the user's global ``~/.pi/agent``.
+
+Corporate OMPR deployments (``OMNIGENT_OMPR_CORPORATE=1``) replace the
+managed provider with a fail-closed combo catalog: when
+``OMNIGENT_OMPR_GATEWAY_URL`` is set the catalog is the ia-panel
+gateway's credential-scoped ``GET /v1/models`` and Pi launches through
+it as an ``openai-completions`` provider; otherwise the OmniRoute-direct
+``GET /v1/combos`` path (``--omniroute --model``) applies.
 """
 
 from __future__ import annotations
@@ -24,8 +31,9 @@ import os
 import re
 import shlex
 import subprocess
+import urllib.error
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypeAlias, TypedDict, TypeGuard
@@ -500,11 +508,16 @@ def omniroute_combo_launch_args(model: str) -> list[str]:
 # ── OMPR corporate mode (fail-closed combo catalog contract) ────────────────
 #
 # Corporate OMPR deployments (ia-portal / COLOTOOL) inject
-# ``OMNIGENT_OMPR_CORPORATE=1`` so OmniRoute's combo catalog becomes the ONLY
-# model source above the gateway. Under the gate an empty or unreachable
-# catalog fails closed — the legacy managed-provider fallback never runs —
-# and a launch always carries an explicit ``--model`` combo id. With the
-# variable unset, non-corporate installs keep today's fallback behavior.
+# ``OMNIGENT_OMPR_CORPORATE=1`` so a combo catalog becomes the ONLY model
+# source above the gateway. Two catalog backends exist: the default
+# OmniRoute-direct ``GET /v1/combos`` (Pi launches with ``--omniroute
+# --model``), and — when ``OMNIGENT_OMPR_GATEWAY_URL`` is set — the ia-panel
+# gateway's credential-scoped ``GET /v1/models`` (Pi launches as an
+# ``openai-completions`` provider holding the device credential). Under the
+# gate an empty or unreachable catalog fails closed — the legacy
+# managed-provider fallback never runs — and a launch always carries an
+# explicit ``--model`` combo id. With the variable unset, non-corporate
+# installs keep today's fallback behavior.
 
 #: Env var that turns on the corporate OMPR fail-closed contract.
 _OMPR_CORPORATE_ENV = "OMNIGENT_OMPR_CORPORATE"
@@ -522,6 +535,81 @@ def ompr_corporate_mode_enabled() -> bool:
         (``1``, ``true``, ``yes``, ``on``, …); unset or falsy → ``False``.
     """
     return os.environ.get(_OMPR_CORPORATE_ENV, "").strip().lower() not in _OMPR_CORPORATE_FALSY
+
+
+#: Env var carrying the ia-panel gateway origin. Setting it (with the
+#: corporate gate on) selects gateway mode.
+_OMPR_GATEWAY_URL_ENV = "OMNIGENT_OMPR_GATEWAY_URL"
+#: Env var carrying the gateway device credential (Bearer token). Never
+#: forwarded host→runner — the runner reads it from the protected catalog
+#: env file, like the OmniRoute catalog token.
+_OMPR_GATEWAY_TOKEN_ENV = "OMNIGENT_OMPR_GATEWAY_TOKEN"
+#: Env var overriding the corporate default combo id.
+_OMPR_DEFAULT_COMBO_ENV = "OMNIGENT_OMPR_DEFAULT_COMBO"
+#: Provider id registered in the generated ``models.json`` in gateway mode.
+_OMPR_GATEWAY_PROVIDER_ID = "ia-panel"
+
+
+def ompr_gateway_config() -> tuple[str, str] | None:
+    """Resolve the ia-panel gateway endpoint and device credential.
+
+    Gateway mode is selected by a non-empty ``OMNIGENT_OMPR_GATEWAY_URL``.
+    Both values resolve least-privilege first: the protected OMPR catalog
+    env file wins over the process env, exactly like
+    :func:`_omniroute_api_key`.
+
+    :returns: ``(base_url, token)`` with any trailing ``/`` stripped from
+        the base URL, or ``None`` when no gateway URL is configured — the
+        caller then keeps the OmniRoute-direct path. The token itself may
+        be empty; the gateway then 401s and the catalog fails closed
+        through :func:`ompr_catalog_options`.
+    """
+    catalog_values = _ompr_catalog_env_values()
+    base_url = (
+        catalog_values.get(_OMPR_GATEWAY_URL_ENV, "").strip()
+        or os.environ.get(_OMPR_GATEWAY_URL_ENV, "").strip()
+    )
+    if not base_url:
+        return None
+    token = (
+        catalog_values.get(_OMPR_GATEWAY_TOKEN_ENV, "").strip()
+        or os.environ.get(_OMPR_GATEWAY_TOKEN_ENV, "").strip()
+    )
+    return base_url.rstrip("/"), token
+
+
+def _fetch_panel_gateway_models(base_url: str, token: str) -> dict[str, object]:
+    """Fetch the credential-scoped combo catalog from the ia-panel gateway.
+
+    ``GET {base_url}/v1/models`` with the device credential as
+    ``Authorization: Bearer``; the gateway answers with exactly the combos
+    that credential is scoped to.
+
+    :param base_url: Panel gateway origin, trailing slash tolerated.
+    :param token: Device credential (``PANEL-xxxx`` pairing result or a
+        credential id).
+    :returns: Decoded ``/v1/models`` payload.
+    """
+    request = urllib.request.Request(f"{base_url.rstrip('/')}/v1/models")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=3) as response:
+        return json.load(response)
+
+
+def _ompr_default_combo() -> str:
+    """Resolve the corporate default combo id.
+
+    ``OMNIGENT_OMPR_DEFAULT_COMBO`` overrides the ``colotool-default``
+    builtin — process env first, then the protected catalog env file.
+
+    :returns: Configured default, or ``"colotool-default"`` when unset.
+    """
+    default = (
+        os.environ.get(_OMPR_DEFAULT_COMBO_ENV, "").strip()
+        or _ompr_catalog_env_values().get(_OMPR_DEFAULT_COMBO_ENV, "").strip()
+    )
+    return default or _OMPR_CORPORATE_DEFAULT_COMBO
 
 
 class OmprComboCatalogError(ValueError):
@@ -542,16 +630,17 @@ def select_ompr_corporate_combo(
     Selection rules, in order:
 
     1. A non-empty catalog is REQUIRED — an empty or unreachable
-       ``GET /v1/models`` aborts the launch.
+       catalog aborts the launch.
     2. An explicit model (session ``/model`` override or spec pin) must be
        a catalog member; valid → it wins, invalid → abort.
-    3. No explicit model → ``colotool-default`` when present.
+    3. No explicit model → the default combo (``OMNIGENT_OMPR_DEFAULT_COMBO``,
+       else ``colotool-default``) when present.
     4. No default and exactly one combo → that combo.
     5. Otherwise → abort; never guess among multiple combos.
 
     :param spec_model: Explicit model id requested for the launch, or ``None``.
-    :param combos: Picker-shaped options from
-        :func:`omniroute_combo_model_options`.
+    :param combos: Picker-shaped options from :func:`ompr_catalog_options`
+        (gateway ``/v1/models``) or :func:`omniroute_combo_model_options`.
     :returns: The selected combo id (always launches with ``--model``).
     :raises OmprComboCatalogError: When no compliant combo can be selected.
     """
@@ -573,33 +662,124 @@ def select_ompr_corporate_combo(
             f"OMPR corporate mode: model {spec_model!r} is not in the OmniRoute "
             f"combo catalog; available combos: {', '.join(combo_ids)}"
         )
-    if _OMPR_CORPORATE_DEFAULT_COMBO in combo_ids:
-        return _OMPR_CORPORATE_DEFAULT_COMBO
+    default_combo = _ompr_default_combo()
+    if default_combo in combo_ids:
+        return default_combo
     if len(combo_ids) == 1:
         return combo_ids[0]
     raise OmprComboCatalogError(
-        "OMPR corporate mode: no explicit model, no 'colotool-default' combo, "
+        f"OMPR corporate mode: no explicit model, no {default_combo!r} combo, "
         f"and the catalog lists {len(combo_ids)} combos; refusing to guess. "
         f"Available combos: {', '.join(combo_ids)}"
     )
 
 
+def ompr_catalog_options() -> list[dict[str, object]]:
+    """Return the corporate combo catalog from the configured backend.
+
+    In gateway mode (``OMNIGENT_OMPR_GATEWAY_URL`` set) the catalog is the
+    ia-panel gateway's credential-scoped ``GET /v1/models``; each
+    ``data[].id`` becomes a picker option. Otherwise this delegates to the
+    OmniRoute-direct :func:`omniroute_combo_model_options`.
+
+    An HTTP 401/403 in gateway mode means the device credential cannot be
+    honoured — not enrolled, pairing code spent/expired, or credential
+    revoked — so it raises :class:`OmprComboCatalogError` naming the cause
+    and telling the user to re-enrol in the panel. Any other network or
+    JSON error returns ``[]`` and fails closed downstream through
+    :func:`select_ompr_corporate_combo`.
+
+    :returns: Picker options ``{"id", "model", "displayName"}``.
+    :raises OmprComboCatalogError: On gateway 401/403 (enrolment failure).
+    """
+    gateway = ompr_gateway_config()
+    if gateway is None:
+        return omniroute_combo_model_options()
+    base_url, token = gateway
+    try:
+        payload = _fetch_panel_gateway_models(base_url, token)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise OmprComboCatalogError(
+                "OMPR corporate mode: the panel gateway refused the device "
+                f"credential (HTTP {exc.code}) — device not enrolled, pairing "
+                "code spent/expired, or credential revoked; re-enrol this "
+                "device in the panel to get a fresh credential"
+            ) from exc
+        return []
+    except (OSError, ValueError):
+        return []
+    data = payload.get("data", [])
+    if not isinstance(data, list):
+        return []
+    names = sorted(
+        str(item.get("id", "")).strip()
+        for item in data
+        if isinstance(item, dict)
+    )
+    return [
+        {"id": name, "model": name, "displayName": name}
+        for name in names
+        if name
+    ]
+
+
+def ompr_gateway_provider(
+    base_url: str,
+    token: str,
+    combo_ids: Sequence[str],
+    selected: str,
+) -> PiProviderConfig:
+    """Build the ia-panel gateway provider for a corporate combo launch.
+
+    Pi talks to the panel gateway as an ``openai-completions`` provider at
+    ``{base_url}/v1``, authenticating with the device credential
+    (``auth_header=True`` sends ``Authorization: Bearer <token>``). Every
+    catalog combo is registered so the picker and ``/model`` switches cannot
+    strand Pi on an unknown model.
+
+    :param base_url: Panel gateway origin (trailing slash tolerated).
+    :param token: Device credential used as the provider ``api_key``.
+    :param combo_ids: All combo ids in the credential's catalog.
+    :param selected: The combo id this launch selects (must be a member).
+    :returns: Provider config rendering to ``provider_id="ia-panel"``.
+    """
+    combos = [combo_id for combo_id in combo_ids if combo_id]
+    return PiProviderConfig(
+        provider_id=_OMPR_GATEWAY_PROVIDER_ID,
+        base_url=f"{base_url.rstrip('/')}/v1",
+        api="openai-completions",
+        model=selected,
+        api_key=token,
+        auth_header=True,
+        extra_models=[{"id": combo_id, "input": ["text", "image"]} for combo_id in combos],
+    )
+
+
 def pi_native_model_options() -> list[dict[str, object]]:
     """Return pre-launch Pi choices configured through ``omni setup``."""
-    combos = omniroute_combo_model_options()
-    if combos:
-        return combos
     if ompr_corporate_mode_enabled():
-        # Corporate OMPR contract: OmniRoute's combo catalog is the only
-        # model source. An empty or unreachable catalog surfaces as an empty
-        # picker — never as the legacy managed-provider fallback, which
-        # would expose a direct provider behind the gateway's back.
+        # Corporate OMPR contract: the combo catalog is the only model
+        # source. Route it through ompr_catalog_options() so gateway mode
+        # lists the credential-scoped /v1/models combos. A refused
+        # credential (401/403) surfaces as an empty picker — never as the
+        # legacy managed-provider fallback, which would expose a direct
+        # provider behind the gateway's back.
+        try:
+            corporate_combos = ompr_catalog_options()
+        except OmprComboCatalogError:
+            corporate_combos = []
+        if corporate_combos:
+            return corporate_combos
         _LOGGER.warning(
-            "pi-native: OMPR corporate mode is on but the OmniRoute combo "
+            "pi-native: OMPR corporate mode is on but the combo "
             "catalog is empty or unreachable; the model picker stays empty "
             "instead of falling back to the managed provider"
         )
         return []
+    combos = omniroute_combo_model_options()
+    if combos:
+        return combos
 
     provider = resolve_pi_native_provider()
     if provider is None:

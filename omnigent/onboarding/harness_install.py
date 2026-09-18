@@ -195,19 +195,18 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         # to "no spawn gate" instead of blocking every codex launch.
         min_version=_CODEX_MIN_VERSION,
     ),
-    # Pi harnesses always launch the ``ompr`` wrapper (oh-my-pi fork with
-    # OmniRoute combo filtering); a bare vendor ``pi`` CLI is never the
-    # default, so readiness/installation gate on the wrapper binary.
+    # Pi harnesses always launch the ``ompr`` launcher: a release ``omp``
+    # binary renamed to ``ompr`` (corporate default, with gateway-enforced
+    # combo filtering server-side). A bare vendor ``pi`` CLI is never the
+    # default, so readiness/installation gate on the launcher binary.
+    # The launcher ships inside the Omnigent Desktop installer (O2/O4), so
+    # there is no install command here — only a hint naming the env
+    # override for expert installs.
     PI_KEY: HarnessInstallSpec(
         "Pi",
         "ompr",
         None,
-        install_command=(
-            "bash",
-            "-c",
-            "ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr",
-        ),
-        install_hint="ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr",
+        install_hint="Install Omnigent Desktop, or set OMNIGENT_PI_PATH=/path/to/ompr",
     ),
     # Pin the install to the supported 1.18.x range: opencode-ai's npm ``latest``
     # is a ``0.0.0-beta-*`` pre-release, so a bare ``opencode-ai`` would install a

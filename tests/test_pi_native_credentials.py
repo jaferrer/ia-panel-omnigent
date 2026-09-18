@@ -2169,3 +2169,312 @@ def test_corporate_gate_aborts_when_bearer_is_rejected(
     assert options == []
     with pytest.raises(creds.OmprComboCatalogError, match="combo catalog is empty or unreachable"):
         creds.select_ompr_corporate_combo(None, options)
+
+# ── OMPR corporate gateway mode (ia-panel gateway as the only LLM entry) ──
+#
+# When OMNIGENT_OMPR_GATEWAY_URL is set (corporate gate on), the combo
+# catalog is the gateway's credential-scoped GET /v1/models and Pi
+# launches as an openai-completions provider holding the device
+# credential — never with --omniroute.
+
+def _make_gateway_models_gate_handler(expected_token: str):  # noqa: ANN202
+    """Build a real http.server handler gating /v1/models on the Bearer."""
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 — http.server API
+            if self.path != "/v1/models":
+                self.send_response(404)
+                self.end_headers()
+                return
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {expected_token}":
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "missing or invalid bearer"}')
+                return
+            body = json.dumps(
+                {
+                    "data": [
+                        {"id": "colotool-default"},
+                        {"id": "Fable5-K"},
+                    ]
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:  # keep pytest output clean
+            pass
+
+    return Handler
+
+
+def _local_gateway_models_server(expected_token: str):  # noqa: ANN202
+    """Serve a real local HTTP /v1/models that enforces the Bearer token."""
+    import threading
+    from contextlib import contextmanager
+    from http.server import ThreadingHTTPServer
+
+    @contextmanager
+    def _server():
+        httpd = ThreadingHTTPServer(
+            ("127.0.0.1", 0), _make_gateway_models_gate_handler(expected_token)
+        )
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{httpd.server_address[1]}"
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    return _server()
+
+
+def _clear_gateway_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove every gateway env source so each test starts clean."""
+    monkeypatch.delenv("OMNIGENT_OMPR_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("OMNIGENT_OMPR_GATEWAY_TOKEN", raising=False)
+    monkeypatch.delenv("OMNIGENT_OMPR_DEFAULT_COMBO", raising=False)
+
+
+def test_ompr_gateway_config_unset_without_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No gateway URL anywhere → None (OmniRoute-direct path preserved)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    assert creds.ompr_gateway_config() is None
+
+
+def test_ompr_gateway_config_reads_env_and_strips_slash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gateway URL comes from the process env; trailing slash is stripped."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "https://panel.example.lab/")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "device-token")
+    assert creds.ompr_gateway_config() == (
+        "https://panel.example.lab",
+        "device-token",
+    )
+
+
+def test_ompr_gateway_config_prefers_catalog_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protected catalog file wins over the process env for both values."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "https://ambient.example/")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "ambient-token")
+    _write_protected_ompr_env_file(
+        tmp_path,
+        "OMNIGENT_OMPR_GATEWAY_URL=https://file.example/\n"
+        "OMNIGENT_OMPR_GATEWAY_TOKEN=file-token\n",
+    )
+    assert creds.ompr_gateway_config() == ("https://file.example", "file-token")
+
+
+def test_gateway_catalog_fetch_hits_models_with_bearer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gateway mode: GET /v1/models with the Bearer; ids become picker options."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    with _local_gateway_models_server("device-token") as base_url:
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", base_url)
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "device-token")
+        options = creds.ompr_catalog_options()
+    assert options == [
+        {"id": "Fable5-K", "model": "Fable5-K", "displayName": "Fable5-K"},
+        {
+            "id": "colotool-default",
+            "model": "colotool-default",
+            "displayName": "colotool-default",
+        },
+    ]
+
+
+def test_gateway_catalog_401_raises_enrolment_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused device credential raises, naming enrolment/revocation."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    with _local_gateway_models_server("device-token") as base_url:
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", base_url)
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "wrong-token")
+        with pytest.raises(creds.OmprComboCatalogError, match="credential revoked"):
+            creds.ompr_catalog_options()
+
+
+def test_gateway_catalog_unreachable_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dead gateway port → [] so the launch aborts via select_ompr_corporate_combo."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "device-token")
+    options = creds.ompr_catalog_options()
+    assert options == []
+    with pytest.raises(
+        creds.OmprComboCatalogError, match="combo catalog is empty or unreachable"
+    ):
+        creds.select_ompr_corporate_combo(None, options)
+
+
+def test_gateway_catalog_uses_file_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The device credential is read from the protected catalog env file."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.delenv("OMNIGENT_OMPR_GATEWAY_TOKEN", raising=False)
+    with _local_gateway_models_server("device-token") as base_url:
+        _write_protected_ompr_env_file(
+            tmp_path,
+            "OMNIGENT_OMPR_GATEWAY_TOKEN=device-token\n"
+            f"OMNIGENT_OMPR_GATEWAY_URL={base_url}\n",
+        )
+        options = creds.ompr_catalog_options()
+    assert [option["id"] for option in options] == ["Fable5-K", "colotool-default"]
+
+
+def test_gateway_two_credentials_yield_two_catalogs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two stubbed gateway responses → two different catalogs, same build."""
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", "https://panel.example")
+    responses = {
+        "credential-one": {"data": [{"id": "combo-alpha"}]},
+        "credential-two": {"data": [{"id": "combo-beta"}]},
+    }
+    monkeypatch.setattr(
+        creds, "_fetch_panel_gateway_models", lambda _url, tok: responses[tok]
+    )
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "credential-one")
+    options_one = creds.ompr_catalog_options()
+    monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "credential-two")
+    options_two = creds.ompr_catalog_options()
+    assert [option["id"] for option in options_one] == ["combo-alpha"]
+    assert [option["id"] for option in options_two] == ["combo-beta"]
+
+
+def test_ompr_default_combo_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OMNIGENT_OMPR_DEFAULT_COMBO replaces colotool-default in rule 3."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    assert creds._ompr_default_combo() == "colotool-default"
+    monkeypatch.setenv("OMNIGENT_OMPR_DEFAULT_COMBO", "combo-corp")
+    assert creds._ompr_default_combo() == "combo-corp"
+    combos = _combo_options("colotool-default", "combo-corp")
+    assert creds.select_ompr_corporate_combo(None, combos) == "combo-corp"
+
+
+def test_ompr_default_combo_single_combo_still_auto_selects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Single-combo catalog auto-selects even with an unrelated default override."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_DEFAULT_COMBO", "combo-corp")
+    assert creds.select_ompr_corporate_combo(None, _combo_options("only-one")) == "only-one"
+
+
+def test_gateway_explicit_model_outside_catalog_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit model not in the credential's catalog → abort listing combos."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    with _local_gateway_models_server("device-token") as base_url:
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", base_url)
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "device-token")
+        options = creds.ompr_catalog_options()
+    with pytest.raises(
+        creds.OmprComboCatalogError,
+        match="GPT5.3-SPARK.*available combos: Fable5-K, colotool-default",
+    ):
+        creds.select_ompr_corporate_combo("GPT5.3-SPARK", options)
+
+
+def test_ompr_gateway_provider_renders_models_config() -> None:
+    """The gateway provider renders baseUrl /v1, authHeader, apiKey, all combos."""
+    provider = creds.ompr_gateway_provider(
+        "https://panel.example.lab/",
+        "device-token",
+        ["colotool-default", "Fable5-K"],
+        "Fable5-K",
+    )
+    assert provider.provider_id == "ia-panel"
+    assert provider.api == "openai-completions"
+    assert provider.auth_header is True
+    rendered = provider.to_models_config()
+    payload = rendered["providers"]["ia-panel"]
+    assert payload["baseUrl"] == "https://panel.example.lab/v1"
+    assert payload["authHeader"] is True
+    assert payload["apiKey"] == "device-token"
+    assert [model["id"] for model in payload["models"]] == [
+        "colotool-default",
+        "Fable5-K",
+    ]
+
+
+def test_gateway_revoked_credential_aborts_corporate_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Gateway 401 on the catalog path → empty options chain into the abort."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    with _local_gateway_models_server("device-token") as base_url:
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", base_url)
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "revoked-token")
+        with pytest.raises(creds.OmprComboCatalogError, match="credential revoked"):
+            creds.ompr_catalog_options()
+
+
+def test_non_gateway_catalog_still_delegates_to_omniroute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a gateway URL the catalog path is OmniRoute-direct, byte-for-byte."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    sentinel = [{"id": "X", "model": "X", "displayName": "X"}]
+    monkeypatch.setattr(creds, "omniroute_combo_model_options", lambda: sentinel)
+    assert creds.ompr_catalog_options() is sentinel
+
+
+def test_corporate_picker_uses_gateway_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Corporate picker lists the gateway catalog; a 401 empties it (no fallback)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _clear_gateway_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OMPR_CORPORATE", "1")
+    with _local_gateway_models_server("device-token") as base_url:
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_URL", base_url)
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "device-token")
+        assert [o["id"] for o in creds.pi_native_model_options()] == [
+            "Fable5-K",
+            "colotool-default",
+        ]
+        monkeypatch.setenv("OMNIGENT_OMPR_GATEWAY_TOKEN", "revoked-token")
+
+        def _forbidden(**_kwargs: object) -> object:
+            raise AssertionError(
+                "resolve_pi_native_provider must not run when the gateway "
+                "refuses the credential"
+            )
+
+        monkeypatch.setattr(creds, "resolve_pi_native_provider", _forbidden)
+        assert creds.pi_native_model_options() == []

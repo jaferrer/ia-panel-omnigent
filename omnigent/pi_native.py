@@ -130,9 +130,10 @@ def resolve_pi_executable(
     resolved = resolve_cli_binary(command, which=which)
     if resolved is None:
         raise click.ClickException(
-            "Native Pi requires the 'ompr' wrapper on PATH. "
-            "Install it with: ln -sf ~/ai/HUB/pi-extensions/bin/ompr ~/.local/bin/ompr "
-            f"You can also set {_PI_PATH_ENV}=/path/to/pi."
+            "Native Pi requires the 'ompr' launcher on PATH "
+            "(release binary 'omp-<platform>' renamed to 'ompr', or the "
+            "dev wrapper). "
+            f"Set {_PI_PATH_ENV}=/path/to/ompr to point at it explicitly."
         )
     return resolved
 

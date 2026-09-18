@@ -280,3 +280,49 @@ uv run omnigent host status
 # abrir sesión Pi NUEVA desde GUI; TUI responde; chat web espeja texto/thinking
 ls ~/.omnigent/pi-native/*/omnigent_pi_native_extension.mjs | tail -1
 ```
+
+## Modo corporativo contra el gateway del panel (O1)
+
+En despliegues corporativos (`OMNIGENT_OMPR_CORPORATE=1`) el gateway del panel
+(`scripts/tui-gateway.ts` de `ia-panel-next-plan`, compatible OpenAI) es la
+ÚNICA entrada LLM. El cliente recibe una credencial de dispositivo revocable
+(código de emparejamiento `PANEL-xxxx` o `credentialId`) cuyo `/v1/models`
+devuelve exactamente los combos de su alcance.
+
+### Variables de entorno
+
+| Variable | Secreta | Cruza host→runner | Descripción |
+|---|---|---|---|
+| `OMNIGENT_OMPR_CORPORATE` | no | sí | Activa el contrato corporativo fail-closed. |
+| `OMNIGENT_OMPR_CATALOG_ENV` | no (ruta) | sí | Ruta al fichero protegido `ompr-catalog.env`. |
+| `OMNIGENT_OMPR_GATEWAY_URL` | no | sí | Origen del gateway; fijarla selecciona modo gateway. |
+| `OMNIGENT_OMPR_DEFAULT_COMBO` | no | sí | Combo por defecto (regla 3); si no, `colotool-default`. |
+| `OMNIGENT_OMPR_GATEWAY_TOKEN` | **sí** | **no** | Credencial de dispositivo (`Authorization: Bearer`). |
+| `OMNIROUTE_API_KEY` | **sí** | **no** | Token del catálogo OmniRoute-directo. |
+
+Los secretos solo viven en el fichero protegido que lee el propio runner
+(`_ompr_catalog_env_values()`); el fichero gana al entorno de proceso, igual
+que `_omniroute_api_key()`. El `env_unset` corporativo de
+`orchestration.py` los elimina del hijo `ompr` generado.
+
+### Flujo en modo gateway
+
+1. `ompr_gateway_config()` resuelve `(base_url, token)` o `None` (ruta
+   OmniRoute-directa intacta cuando no hay URL).
+2. `ompr_catalog_options()` hace `GET {base}/v1/models` con el Bearer y
+   convierte `data[].id` en opciones `{id, model, displayName}`.
+3. Un 401/403 del gateway lanza `OmprComboCatalogError` con mensaje de
+   matriculación (dispositivo no matriculado, código gastado/caducado o
+   credencial revocada → re-matricular en el panel). Otros errores de
+   red/JSON devuelven `[]`, que aborta vía `select_ompr_corporate_combo`.
+4. `select_ompr_corporate_combo()` aplica las 5 reglas con el defecto
+   configurable (`_ompr_default_combo()`).
+5. `orchestration.py` construye `ompr_gateway_provider(...)` (proveedor
+   `openai-completions`, `provider_id="ia-panel"`,
+   `base_url="{base}/v1"`, `auth_header=True`, todos los combos
+   registrados) y fusiona su `cred_env`/`cred_args` como la rama
+   `provider is not None` existente — `--provider ia-panel --model <combo>`,
+   nunca `--omniroute`.
+6. `pi_native_model_options()` usa `ompr_catalog_options()` en modo
+   corporativo: con credencial rechazada el selector queda vacío, nunca el
+   fallback del proveedor gestionado.
